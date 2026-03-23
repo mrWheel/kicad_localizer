@@ -12,7 +12,6 @@ except Exception:
 
 
 LOCAL_LIB = "localLib"
-LOCAL_LIBS_DIR = "localLibs"
 
 
 class RuntimeLogger:
@@ -476,37 +475,30 @@ def export_component_files(
   return exported, stats
 
 
-def build_combined_symbol_library(root, logger=None):
-  libs_dir = root / LOCAL_LIBS_DIR
-  libs_dir.mkdir(parents=True, exist_ok=True)
-
-  components_dir = root / "components"
-  component_symbol_paths = sorted(components_dir.glob("*/*.kicad_sym"))
+def build_combined_symbol_library(root, exported_components):
+  sym_dir = root / "sym"
+  sym_dir.mkdir(parents=True, exist_ok=True)
 
   blocks = []
-  for sym_path in component_symbol_paths:
+  for component_name in sorted(exported_components.keys()):
+    sym_path = exported_components[component_name]["symbol"]
     content = sym_path.read_text(encoding="utf-8")
-    for block in extract_symbol_blocks(content):
-      if re.match(r'\(symbol\s+"([^"]+)"', block):
-        blocks.append(block)
-        break
-
-  if logger is not None:
-    logger.info(f"component symbol files found for localLib: {len(component_symbol_paths)}")
-    logger.info(f"symbol blocks added to localLib: {len(blocks)}")
+    block = find_block_by_token(content, "(symbol ")
+    if block:
+      blocks.append(block)
 
   lib_text = "(kicad_symbol_lib (version 20211014) (generator localizer)\n"
   for block in blocks:
     lib_text += f"  {block}\n"
   lib_text += ")\n"
 
-  local_sym = libs_dir / f"{LOCAL_LIB}.kicad_sym"
+  local_sym = sym_dir / f"{LOCAL_LIB}.kicad_sym"
   local_sym.write_text(lib_text, encoding="utf-8")
   return local_sym
 
 
 def build_combined_footprint_library(root, exported_components):
-  fp_dir = root / LOCAL_LIBS_DIR / f"{LOCAL_LIB}.pretty"
+  fp_dir = root / "footprints" / f"{LOCAL_LIB}.pretty"
   fp_dir.mkdir(parents=True, exist_ok=True)
 
   for component_name in sorted(exported_components.keys()):
@@ -521,7 +513,7 @@ def build_combined_footprint_library(root, exported_components):
 
 
 def build_combined_3d_directory(root, exported_components):
-  out_dir = root / LOCAL_LIBS_DIR / "3d"
+  out_dir = root / "3d"
   out_dir.mkdir(parents=True, exist_ok=True)
 
   has_step = set()
@@ -569,7 +561,7 @@ def rewrite_board(board, footprint_to_component, components_with_step):
 
     if component_name in components_with_step:
       for model in fp.Models():
-        model.m_Filename = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}.step"
+        model.m_Filename = f"${{KIPRJMOD}}/3d/{component_name}.step"
 
 
 def ensure_tables(root):
@@ -578,7 +570,7 @@ def ensure_tables(root):
 (fp_lib_table
   (lib (name \"{LOCAL_LIB}\")
     (type \"KiCad\")
-    (uri \"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/{LOCAL_LIB}.pretty\")
+    (uri \"${{KIPRJMOD}}/footprints/{LOCAL_LIB}.pretty\")
   )
 )
 """.strip()
@@ -591,7 +583,7 @@ def ensure_tables(root):
 (sym_lib_table
   (lib (name \"{LOCAL_LIB}\")
     (type \"KiCad\")
-    (uri \"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/{LOCAL_LIB}.kicad_sym\")
+    (uri \"${{KIPRJMOD}}/sym/{LOCAL_LIB}.kicad_sym\")
   )
 )
 """.strip()
@@ -671,20 +663,11 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
       logger.error("components/ is empty because no component symbols could be exported")
       return
 
-    logger.info(f"3) Build {LOCAL_LIBS_DIR}/{LOCAL_LIB}.kicad_sym from components/")
-    build_combined_symbol_library(root, logger)
-
-    logger.info(f"4) Build {LOCAL_LIBS_DIR}/{LOCAL_LIB}.pretty from components/")
-    build_combined_footprint_library(root, exported)
-
-    logger.info(f"5) Build {LOCAL_LIBS_DIR}/3d from components/")
-    build_combined_3d_directory(root, exported)
-
-    logger.info("6) Write project library tables")
-    ensure_tables(root)
+    logger.info("3) Components export complete")
+    logger.info("Skipping local library generation and schematic/pcb rewrite")
 
     pcbnew.Refresh()
-    logger.info(f"DONE (components + {LOCAL_LIBS_DIR}/)")
+    logger.info("DONE (components only)")
 
 
 KiCadLocalizerPlugin().register()
