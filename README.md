@@ -1,181 +1,82 @@
-# KiCad Extract Project Local Library Plugin
+# KiCad Localizer Plugin
 
 ## Overview
-This KiCad Action Plugin extracts all **used components** from the currently opened project and converts them into a **fully self-contained local library structure**.
+A KiCad Action Plugin that turns a project into a self-contained, portable set of local libraries.
 
-The plugin collects:
-- Symbols
-- Footprints
-- 3D STEP models
+The plugin:
+- Exports used components into per-component folders
+- Builds local project libraries in `localLibs/`
+- Writes `sym-lib-table` and `fp-lib-table`
+- Rewrites schematic and PCB references to point to `localLib`
+- Validates 3D model paths and logs errors when paths do not point to `localLibs/3d/`
 
-It then reorganizes them into:
-- Per-component folders (for traceability and version control)
-- A combined project-local symbol library
-- A combined project-local footprint library
+## Output structure
 
-This enables:
-- Fully portable KiCad projects
-- Reproducible builds
-- Clean Git repositories without external dependencies
+```text
+project_root/
+  components/
+    <component>/
+      <component>.kicad_sym
+      <component>.kicad_mod
+      <component>.step
 
----
+  localLibs/
+    localLib.kicad_sym
+    localLib.pretty/
+      <component>.kicad_mod
+    3d/
+      <component>.step
 
-## Features
-
-### ✔ Extract Used Components
-- Parses schematic (`.kicad_sch`)
-- Detects all used symbols
-- Resolves original libraries
-
-### ✔ Per-Component Structure
-Each component is stored in its own folder:
-
-```
-components/<component_name>/
-  <component_name>.kicad_sym
-  <component_name>.kicad_mod
-  <component_name>.step
+  sym-lib-table
+  fp-lib-table
 ```
 
-### ✔ Local Libraries
-Creates project-local libraries:
+## What gets rewritten
 
-```
-localLibs/localLib.kicad_sym
-localLibs/localLib.pretty/
-localLibs/3d/
-```
+- **Schematic**
+  - `lib_id` for exported components → `localLib:<component>`
+  - Footprint property for exported components → `localLib:<component>`
 
-### ✔ 3D Model Handling
-- Copies STEP files
-- Rewrites paths to:
+- **PCB**
+  - Footprint library link → `localLib:<component>`
+  - 3D model paths → `${KIPRJMOD}/localLibs/3d/<component>.step`
 
-```
-${KIPRJMOD}/localLibs/3d/<component>.step
-```
+## Logging and validation
 
-### ✔ Deterministic Output
-- Stable file naming
-- Repeatable results (idempotent)
-
-### ✔ Safe Operation
-- Never modifies original libraries
-- Only reads and copies data
-
----
+During a run the plugin produces:
+- Export totals (symbols, footprints, steps)
+- 3D rewrite totals for `localLib.pretty` and PCB
+- Per-component transition lines: `Component: OldLib -> NewLib`
+- Before/after summary of model references
+- `ERROR` if any model path does not start with `${KIPRJMOD}/localLibs/3d/`
 
 ## Installation
 
-1. Locate your KiCad plugin directory:
+Copy the plugin folder into the KiCad scripting plugins directory and restart KiCad.
 
-- Linux:
-  `~/.local/share/kicad/10.0/scripting/plugins`
-- Windows:
-  `%APPDATA%\kicad\10.0\scripting\plugins`
-- macOS:
-  `~/Library/Application Support/kicad/10.0/scripting/plugins`
-
-2. Copy the plugin folder:
-
-```
-ExtractProjectLocalLibrary/
-  __init__.py
-  plugin.py
-  dialog.py
-  ...
-  icon.png
-  README.md
-```
-
-3. Restart KiCad
-
----
+Common paths:
+- macOS: `~/Documents/KiCad/9.0/scripting/plugins`
+- Linux: `~/.local/share/kicad/9.0/scripting/plugins`
+- Windows: `%APPDATA%\kicad\9.0\scripting\plugins`
 
 ## Usage
 
-1. Open your KiCad project
-2. Open PCB Editor (recommended)
-3. Go to:
+1. Open the project in KiCad
+2. Open the PCB Editor
+3. Run the **KiCad Localizer** Action Plugin
+4. Review the log output and the generated files in the project root
 
-```
-Tools → External Plugins → Extract Project Local Library
-```
+## Toolbar icon
 
-4. (Optional) Configure options in dialog
-5. Click **Run**
-
----
-
-## Output Structure
-
-```
-project_root/
-  components/
-  localLibs/localLib.kicad_sym
-  localLibs/localLib.pretty/
-  localLibs/3d/
-```
-
----
-
-## Configuration Options (if enabled)
-
-- Copy footprints
-- Copy STEP files
-- Rebuild symbol library
-- Rebuild footprint library
-- Rewrite 3D paths
-- Overwrite existing files
-- Dry-run mode
-
----
+The plugin picks the first existing icon file found in the plugin folder:
+- `kicad_localizer.png`
+- `icon.png`
 
 ## Limitations
 
-- Complex symbol inheritance may be flattened
-- Missing footprints or models are skipped with warnings
-- Requires valid KiCad project files
-
----
-
-## Logging
-
-The plugin provides clear logs:
-
-```
-Info: Processing symbol AO4301
-Warning: Missing footprint XYZ
-Error: Symbol not found
-```
-
----
-
-## Advanced Use
-
-### CI/CD
-This plugin can be used in automated workflows to:
-- Freeze dependencies
-- Ensure reproducible builds
-
-### Git Integration
-- Commit `components/`
-- Commit `localLibs/`
-- Ignore global libraries
-
----
+- Only components that can be traced back through both schematic and PCB are fully localized
+- Missing footprints or STEP files are skipped with a warning
+- Only STEP/STP models are copied to `localLibs/3d/`
 
 ## License
-MIT (or specify your preferred license)
-
----
-
-## Author
-Generated with AI assistance
-
----
-
-## Future Improvements
-- Multi-library merging improvements
-- Better alias handling
-- GUI progress bar
-- SVG icon support
+MIT

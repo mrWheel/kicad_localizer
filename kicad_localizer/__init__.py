@@ -64,11 +64,16 @@ class RuntimeLogger:
 
 
 def resolve_env_path(path_str):
-  def repl(match):
+  def repl_brace(match):
     var = match.group(1)
     return os.environ.get(var, match.group(0))
 
-  return re.sub(r"\$\{([^}]+)\}", repl, path_str)
+  def repl_paren(match):
+    var = match.group(1)
+    return os.environ.get(var, match.group(0))
+
+  resolved = re.sub(r"\$\{([^}]+)\}", repl_brace, path_str)
+  return re.sub(r"\$\(([^)]+)\)", repl_paren, resolved)
 
 
 def find_balanced_block(content, start_index):
@@ -537,18 +542,39 @@ def build_combined_3d_directory(root, exported_components):
   return out_dir, has_step
 
 
-def rewrite_schematic(sch_path, footprint_to_component):
+def rewrite_schematic(sch_path, footprint_to_component, exported_names):
   content = sch_path.read_text(encoding="utf-8")
+
+  def rewrite_lib_id(match):
+    item_name = match.group(2)
+    if item_name not in exported_names:
+      return match.group(0)  # leave untouched (power symbols, etc.)
+    return f'(lib_id "{LOCAL_LIB}:{item_name}")'
 
   content = re.sub(
     r'\(lib_id\s+"([^"]+):([^"]+)"\)',
-    lambda m: f'(lib_id "{LOCAL_LIB}:{m.group(2)}")',
+    rewrite_lib_id,
+    content,
+  )
+
+  def rewrite_symbol_definition_name(match):
+    item_name = match.group(2)
+    if item_name not in exported_names:
+      return match.group(0)  # leave untouched (power/device symbols, etc.)
+    return f'(symbol "{LOCAL_LIB}:{item_name}"'
+
+  # Keep in-file cached symbol definitions aligned with rewritten lib_id entries.
+  content = re.sub(
+    r'\(symbol\s+"([^"]+):([^"]+)"',
+    rewrite_symbol_definition_name,
     content,
   )
 
   def rewrite_footprint_property(match):
     base_name = match.group(2)
     component_name = footprint_to_component.get(base_name, base_name)
+    if component_name not in exported_names:
+      return match.group(0)  # leave untouched
     return f'(property "Footprint" "{LOCAL_LIB}:{component_name}"'
 
   content = re.sub(
@@ -560,16 +586,210 @@ def rewrite_schematic(sch_path, footprint_to_component):
   sch_path.write_text(content, encoding="utf-8")
 
 
-def rewrite_board(board, footprint_to_component, components_with_step):
+def rewrite_board(board, root, footprint_to_component):
+  step_dir = root / LOCAL_LIBS_DIR / "3d"
+  available_steps = {p.stem for p in step_dir.glob("*.step")}
+  changed_models = 0
+
   for fp in board.GetFootprints():
     old_name = str(fp.GetFPID().GetLibItemName())
     component_name = footprint_to_component.get(old_name, old_name)
 
     fp.SetFPID(pcbnew.LIB_ID(LOCAL_LIB, component_name))
 
-    if component_name in components_with_step:
-      for model in fp.Models():
-        model.m_Filename = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}.step"
+    models = fp.Models()
+    try:
+      model_count = len(models)
+    except Exception:
+      model_count = models.size() if hasattr(models, "size") else 0
+
+    for i in range(model_count):
+      model = models[i]
+      target_name = component_name
+
+      # Fallback: if the mapped component has no STEP, reuse model basename when possible.
+      if target_name not in available_steps:
+        model_path = str(model.m_Filename).replace('\\', '/')
+        basename = model_path.rsplit('/', 1)[-1]
+        stem = basename.rsplit('.', 1)[0] if '.' in basename else basename
+        if stem in available_steps:
+          target_name = stem
+
+      if target_name in available_steps:
+        new_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{target_name}.step"
+        if str(model.m_Filename) == new_ref:
+          continue
+        try:
+          models[i].m_Filename = new_ref
+          changed_models += 1
+        except Exception:
+          model.m_Filename = new_ref
+          try:
+            models[i] = model
+            changed_models += 1
+          except Exception:
+            pass
+
+  return changed_models
+
+
+def rewrite_board_model_paths_in_file(pcb_path, root):
+  content = pcb_path.read_text(encoding="utf-8")
+  changed_lines = 0
+  transitions = {}
+
+  def model_lib_name(model_ref):
+    if model_ref.startswith("${") and "}/" in model_ref:
+      return model_ref[2:model_ref.find("}")]
+    if model_ref.startswith("$(") and ")/" in model_ref:
+      return model_ref[2:model_ref.find(")")]
+    if "/" in model_ref:
+      return model_ref.split("/", 1)[0]
+    return model_ref
+
+  for step_file in sorted((root / LOCAL_LIBS_DIR / "3d").glob("*.step")):
+    component_name = step_file.stem
+    model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}.step"
+    pattern = r'\(model\s+"([^"]*/' + re.escape(component_name) + r'\.(?:step|stp))"'
+
+    def repl(match):
+      nonlocal changed_lines
+      old_ref = match.group(1)
+      old_lib = model_lib_name(old_ref)
+      new_lib = f"KIPRJMOD/{LOCAL_LIBS_DIR}/3d"
+      transitions.setdefault(component_name, set()).add((old_lib, new_lib))
+      changed_lines += 1
+      return f'(model "{model_ref}"'
+
+    content = re.sub(pattern, repl, content)
+
+  if changed_lines:
+    pcb_path.write_text(content, encoding="utf-8")
+
+  return changed_lines, transitions
+
+
+def rewrite_pretty_model_paths(root):
+  pretty_dir = root / LOCAL_LIBS_DIR / f"{LOCAL_LIB}.pretty"
+  if not pretty_dir.exists():
+    return 0, {}
+
+  changed_lines = 0
+  transitions = {}
+
+  def model_lib_name(model_ref):
+    if model_ref.startswith("${") and "}/" in model_ref:
+      return model_ref[2:model_ref.find("}")]
+    if model_ref.startswith("$(") and ")/" in model_ref:
+      return model_ref[2:model_ref.find(")")]
+    if "/" in model_ref:
+      return model_ref.split("/", 1)[0]
+    return model_ref
+
+  for mod_path in pretty_dir.glob("*.kicad_mod"):
+    content = mod_path.read_text(encoding="utf-8")
+    component_name = mod_path.stem
+    step_path = root / LOCAL_LIBS_DIR / "3d" / f"{component_name}.step"
+    if not step_path.exists():
+      continue
+
+    model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}.step"
+    pattern = r'\(model\s+"([^"]+)"'
+
+    def repl(match):
+      nonlocal changed_lines
+      old_ref = match.group(1)
+      old_lib = model_lib_name(old_ref)
+      new_lib = f"KIPRJMOD/{LOCAL_LIBS_DIR}/3d"
+      transitions.setdefault(component_name, set()).add((old_lib, new_lib))
+      changed_lines += 1
+      return f'(model "{model_ref}"'
+
+    new_content = re.sub(pattern, repl, content)
+    if new_content != content:
+      mod_path.write_text(new_content, encoding="utf-8")
+
+  return changed_lines, transitions
+
+
+def log_library_transitions(logger, title, transitions):
+  logger.info(title)
+  if not transitions:
+    logger.info("  none")
+    return
+
+  for component_name in sorted(transitions.keys()):
+    for old_lib, new_lib in sorted(transitions[component_name]):
+      logger.info(f"  {component_name}: {old_lib} -> {new_lib}")
+
+
+def log_non_kiprjmod_3d_errors(logger, root, pcb_path):
+  target_prefix = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/"
+
+  pcb_refs = re.findall(r'\(model\s+"([^"]+)"', pcb_path.read_text(encoding="utf-8"))
+  pcb_bad = sorted({ref for ref in pcb_refs if not ref.startswith(target_prefix)})
+
+  pretty_bad = []
+  pretty_dir = root / LOCAL_LIBS_DIR / f"{LOCAL_LIB}.pretty"
+  if pretty_dir.exists():
+    for mod_path in pretty_dir.glob("*.kicad_mod"):
+      refs = re.findall(r'\(model\s+"([^"]+)"', mod_path.read_text(encoding="utf-8"))
+      for ref in refs:
+        if not ref.startswith(target_prefix):
+          pretty_bad.append((mod_path.name, ref))
+
+  if not pcb_bad and not pretty_bad:
+    logger.info("3D model path validation: OK (all refs use KIPRJMOD/localLibs/3d)")
+    return
+
+  logger.error(
+    "3D model path validation FAILED: "
+    f"pcb_non_kiprjmod={len(pcb_bad)}, pretty_non_kiprjmod={len(pretty_bad)}"
+  )
+
+  for i, ref in enumerate(pcb_bad[:5], start=1):
+    logger.error(f"pcb non-kiprjmod[{i}] = {ref}")
+
+  for i, (name, ref) in enumerate(pretty_bad[:5], start=1):
+    logger.error(f"pretty non-kiprjmod[{i}] {name} = {ref}")
+
+
+def log_model_ref_summary(logger, root, pcb_path, phase):
+  target_prefix = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/"
+  pcb_content = pcb_path.read_text(encoding="utf-8")
+  pcb_refs = re.findall(r'\(model\s+"([^"]+)"', pcb_content)
+  pcb_bad_refs = [ref for ref in pcb_refs if not ref.startswith(target_prefix)]
+  pcb_local_count = sum(1 for ref in pcb_refs if ref.startswith(target_prefix))
+
+  logger.info(
+    f"debug {phase} pcb models: total={len(pcb_refs)}, "
+    f"non_kiprjmod={len(pcb_bad_refs)}, localLibs={pcb_local_count}"
+  )
+  for i, ref in enumerate(pcb_bad_refs[:3], start=1):
+    logger.warn(f"debug {phase} pcb non_kiprjmod[{i}] = {ref}")
+
+  pretty_dir = root / LOCAL_LIBS_DIR / f"{LOCAL_LIB}.pretty"
+  pretty_total = 0
+  pretty_local = 0
+  pretty_old_refs = []
+  files_scanned = 0
+
+  if pretty_dir.exists():
+    for mod_path in pretty_dir.glob("*.kicad_mod"):
+      files_scanned += 1
+      refs = re.findall(r'\(model\s+"([^"]+)"', mod_path.read_text(encoding="utf-8"))
+      pretty_total += len(refs)
+      pretty_local += sum(1 for ref in refs if ref.startswith(target_prefix))
+      for ref in refs:
+        if not ref.startswith(target_prefix):
+          pretty_old_refs.append((mod_path.name, ref))
+
+  logger.info(
+    f"debug {phase} pretty models: files={files_scanned}, total={pretty_total}, "
+    f"non_kiprjmod={len(pretty_old_refs)}, localLibs={pretty_local}"
+  )
+  for i, (name, ref) in enumerate(pretty_old_refs[:3], start=1):
+    logger.warn(f"debug {phase} pretty non_kiprjmod[{i}] {name} = {ref}")
 
 
 def ensure_tables(root):
@@ -607,8 +827,20 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
     self.description = "Export per-component symbol, footprint, and step files"
     self.show_toolbar_button = True
 
+    plugin_dir = Path(__file__).resolve().parent
+    icon_candidates = [
+      "kicad_localizer.png",  # user-provided filename
+      "icon.png",
+    ]
+    for icon_name in icon_candidates:
+      icon_path = plugin_dir / icon_name
+      if icon_path.exists():
+        self.icon_file_name = str(icon_path)
+        break
+
   def Run(self):
     logger = RuntimeLogger("KiCad Localizer Log")
+    logger.info(f"plugin source: {Path(__file__).resolve()}")
 
     board = pcbnew.GetBoard()
     root = Path(board.GetFileName()).parent
@@ -625,7 +857,7 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
     logger.info(f"project root: {root}")
     logger.info("1) Parse schematic and board")
 
-    sch_content, components, _, reference_to_component = parse_used_components(sch_path)
+    sch_content, components, footprint_to_component, reference_to_component = parse_used_components(sch_path)
     symbol_map = extract_symbol_definition_map(sch_content)
     footprint_map = extract_footprint_map(pcb_path)
     model_paths = collect_footprint_model_paths(board)
@@ -682,6 +914,32 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
 
     logger.info("6) Write project library tables")
     ensure_tables(root)
+
+    logger.info("7) Rewrite schematic library references")
+    rewrite_schematic(sch_path, footprint_to_component, set(exported.keys()))
+
+    logger.info("8) Rewrite board footprint and 3D references")
+    log_model_ref_summary(logger, root, pcb_path, "before")
+    mem_updates = rewrite_board(board, root, footprint_to_component)
+    logger.info(f"in-memory 3D model entries rewritten: {mem_updates}")
+    board.Save(str(pcb_path))
+    pretty_models, pretty_transitions = rewrite_pretty_model_paths(root)
+    logger.info(f"localLib.pretty 3D model entries rewritten: {pretty_models}")
+    changed_models, pcb_transitions = rewrite_board_model_paths_in_file(pcb_path, root)
+    logger.info(f"pcb 3D model entries rewritten in file: {changed_models}")
+    log_library_transitions(logger, "3D library transitions (pretty):", pretty_transitions)
+    log_library_transitions(logger, "3D library transitions (pcb):", pcb_transitions)
+    log_model_ref_summary(logger, root, pcb_path, "after")
+    log_non_kiprjmod_3d_errors(logger, root, pcb_path)
+
+    logger.info(
+      "SUMMARY "
+      f"symbols={export_stats['exported_symbol']} "
+      f"footprints={export_stats['exported_footprint']} "
+      f"steps={export_stats['exported_step']} "
+      f"pretty3d={pretty_models} "
+      f"pcb3d={changed_models}"
+    )
 
     pcbnew.Refresh()
     logger.info(f"DONE (components + {LOCAL_LIBS_DIR}/)")
