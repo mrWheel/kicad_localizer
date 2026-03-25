@@ -1,6 +1,8 @@
 import os
 import re
 import shutil
+import glob
+import json
 from pathlib import Path
 
 import pcbnew
@@ -13,6 +15,102 @@ except Exception:
 
 LOCAL_LIB = "localLib"
 LOCAL_LIBS_DIR = "localLibs"
+MODEL_EXT_PRIORITY = [".step", ".stp", ".wrl"]
+
+_PATH_VARS_CACHE = {}
+
+
+def parse_version_key(path_obj):
+  name = path_obj.parent.name
+  parts = re.findall(r"\d+", name)
+  if not parts:
+    return (0,)
+  return tuple(int(p) for p in parts)
+
+
+def load_kicad_common_path_vars():
+  candidates = []
+
+  candidates.extend([Path(p) for p in glob.glob(os.path.expanduser("~/Library/Preferences/kicad/*/kicad_common.json"))])
+  candidates.extend([Path(p) for p in glob.glob(os.path.expanduser("~/.config/kicad/*/kicad_common.json"))])
+
+  vars_map = {}
+  for cfg in sorted(candidates, key=parse_version_key, reverse=True):
+    try:
+      data = json.loads(cfg.read_text(encoding="utf-8"))
+    except Exception:
+      continue
+
+    env_vars = data.get("environment", {}).get("vars", {})
+    if isinstance(env_vars, dict):
+      for k, v in env_vars.items():
+        if isinstance(k, str) and isinstance(v, str):
+          vars_map[k] = v
+
+    if vars_map:
+      break
+
+  return vars_map
+
+
+def discover_kicad_install_path_vars():
+  install_roots = []
+  install_roots.extend(sorted(glob.glob("/Applications/KiCad-*/KiCad-*.app/Contents/SharedSupport")))
+  install_roots.extend(sorted(glob.glob("/Applications/KiCad/KiCad.app/Contents/SharedSupport")))
+
+  discovered = {}
+  for root in install_roots:
+    root_path = Path(root)
+    if not root_path.exists():
+      continue
+
+    m = re.search(r"KiCad-(\d+)", str(root_path))
+    major = m.group(1) if m else None
+
+    three_d = root_path / "3dmodels"
+    if three_d.exists():
+      if major:
+        discovered.setdefault(f"KICAD{major}_3DMODEL_DIR", str(three_d))
+      discovered.setdefault("KISYS3DMOD", str(three_d))
+
+  return discovered
+
+
+def load_project_text_vars(project_root):
+  if project_root is None:
+    return {}
+
+  project_root = Path(project_root)
+  pro_files = sorted(project_root.glob("*.kicad_pro"))
+  if not pro_files:
+    return {}
+
+  try:
+    data = json.loads(pro_files[0].read_text(encoding="utf-8"))
+  except Exception:
+    return {}
+
+  text_vars = data.get("text_variables", {})
+  if not isinstance(text_vars, dict):
+    return {}
+
+  return {k: v for k, v in text_vars.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def get_path_vars(project_root=None):
+  key = str(project_root) if project_root else "GLOBAL"
+  cached = _PATH_VARS_CACHE.get(key)
+  if cached is not None:
+    return cached
+
+  path_vars = {}
+  path_vars.update(os.environ)
+  path_vars.update(load_kicad_common_path_vars())
+  path_vars.update(discover_kicad_install_path_vars())
+  path_vars.update(load_project_text_vars(project_root))
+
+  _PATH_VARS_CACHE[key] = path_vars
+  return path_vars
 
 
 class RuntimeLogger:
@@ -63,17 +161,35 @@ class RuntimeLogger:
     self._write("ERROR", message)
 
 
-def resolve_env_path(path_str):
+def resolve_env_path(path_str, project_root=None):
+  path_vars = get_path_vars(project_root)
+
+  def resolve_var(var_name):
+    return path_vars.get(var_name)
+
   def repl_brace(match):
     var = match.group(1)
-    return os.environ.get(var, match.group(0))
+    resolved_var = resolve_var(var)
+    return resolved_var if resolved_var else match.group(0)
 
   def repl_paren(match):
     var = match.group(1)
-    return os.environ.get(var, match.group(0))
+    resolved_var = resolve_var(var)
+    return resolved_var if resolved_var else match.group(0)
 
   resolved = re.sub(r"\$\{([^}]+)\}", repl_brace, path_str)
   return re.sub(r"\$\(([^)]+)\)", repl_paren, resolved)
+
+
+def split_footprint_reference(footprint_ref):
+  if not footprint_ref:
+    return "", ""
+
+  if ":" in footprint_ref:
+    lib_nick, item_name = footprint_ref.split(":", 1)
+    return lib_nick.strip(), item_name.strip()
+
+  return "", footprint_ref.strip()
 
 
 def find_balanced_block(content, start_index):
@@ -129,6 +245,35 @@ def extract_symbol_blocks(content):
   return blocks
 
 
+def extract_direct_child_blocks(root_block, token):
+  blocks = []
+  depth = 0
+  i = 0
+
+  while i < len(root_block):
+    ch = root_block[i]
+
+    if ch == "(":
+      if depth == 1 and root_block.startswith(token, i):
+        block = find_balanced_block(root_block, i)
+        if block is None:
+          break
+        blocks.append(block)
+        i += len(block)
+        continue
+
+      depth += 1
+      i += 1
+      continue
+
+    if ch == ")":
+      depth -= 1
+
+    i += 1
+
+  return blocks
+
+
 def split_top_level_symbols(lib_symbols_block):
   body = lib_symbols_block[len("(lib_symbols"):]
   if body.endswith(")"):
@@ -152,11 +297,44 @@ def split_top_level_symbols(lib_symbols_block):
   return symbols
 
 
+def get_symbol_block_name(symbol_block):
+  match = re.match(r'\(symbol\s+"([^"]+)"', symbol_block)
+  return match.group(1) if match else None
+
+
+def prefix_symbol_block_name(symbol_block, library_name):
+  symbol_name = get_symbol_block_name(symbol_block)
+  if symbol_name is None:
+    return symbol_block
+
+  qualified_name = symbol_name if ":" in symbol_name else f"{library_name}:{symbol_name}"
+  return re.sub(
+    r'\(symbol\s+"([^"]+)"',
+    f'(symbol "{qualified_name}"',
+    symbol_block,
+    count=1,
+  )
+
+
 def normalize_symbol_block_name(symbol_block, symbol_name):
+  # Normalize every symbol declaration in the block to local names without
+  # library prefixes (e.g. Device:R_0_1 -> R_0_1).
+  def repl(match):
+    raw_name = match.group(1)
+    local_name = raw_name.split(":")[-1]
+    return f'(symbol "{local_name}"'
+
+  normalized = re.sub(
+    r'\(symbol\s+"([^"]+)"',
+    repl,
+    symbol_block,
+  )
+
+  # Ensure the top-level declaration matches the exported component name.
   return re.sub(
     r'\(symbol\s+"([^"]+)"',
     f'(symbol "{symbol_name}"',
-    symbol_block,
+    normalized,
     count=1,
   )
 
@@ -230,6 +408,7 @@ def parse_used_components(sch_path):
     if footprint_match:
       footprint_value = footprint_match.group(1)
       footprint_name = footprint_value.split(":")[-1] if ":" in footprint_value else footprint_value
+    footprint_full = footprint_match.group(1).strip() if footprint_match else ""
 
     reference_name = ""
     if reference_match:
@@ -239,11 +418,15 @@ def parse_used_components(sch_path):
       components[symbol_name] = {
         "symbol": symbol_name,
         "footprint": footprint_name,
+        "footprint_full": footprint_full,
       }
     else:
       existing_fp = components[symbol_name]["footprint"]
       if not existing_fp and footprint_name:
         components[symbol_name]["footprint"] = footprint_name
+      existing_full = components[symbol_name].get("footprint_full", "")
+      if not existing_full and footprint_full:
+        components[symbol_name]["footprint_full"] = footprint_full
 
     if footprint_name and footprint_name not in footprint_to_component:
       footprint_to_component[footprint_name] = symbol_name
@@ -286,6 +469,9 @@ def parse_used_components(sch_path):
 
           if footprint_name not in footprint_to_component:
             footprint_to_component[footprint_name] = component_name
+
+        if footprint_value and not components[component_name].get("footprint_full"):
+          components[component_name]["footprint_full"] = footprint_value
 
   # Fallback if symbol instance parsing failed on unusual schematic formatting.
   if not components:
@@ -337,24 +523,94 @@ def extract_footprint_map(pcb_path):
   return footprint_map
 
 
+def pick_preferred_model_path(model_candidates):
+  if not model_candidates:
+    return None
+
+  by_ext = {Path(p).suffix.lower(): Path(p) for p in model_candidates}
+  for ext in MODEL_EXT_PRIORITY:
+    if ext in by_ext:
+      return by_ext[ext]
+
+  return Path(model_candidates[0])
+
+
 def collect_footprint_model_paths(board):
   model_paths = {}
 
   for fp in board.GetFootprints():
     footprint_name = str(fp.GetFPID().GetLibItemName())
-    step_path = None
+    model_candidates = []
+
+    for model in fp.Models():
+      src = Path(resolve_env_path(str(model.m_Filename), Path(board.GetFileName()).parent))
+      ext = src.suffix.lower()
+      if ext in MODEL_EXT_PRIORITY and src.exists():
+        model_candidates.append(src)
+
+    best_model = pick_preferred_model_path(model_candidates)
+    if best_model is not None and footprint_name not in model_paths:
+      model_paths[footprint_name] = best_model
+
+  return model_paths
+
+
+def resolve_model_from_footprint_library(footprint_ref, project_root):
+  lib_nick, item_name = split_footprint_reference(footprint_ref)
+  if not lib_nick or not item_name:
+    return None
+
+  try:
+    loaded_fp = pcbnew.FootprintLoad(lib_nick, item_name)
+  except Exception:
+    return None
+
+  if loaded_fp is None:
+    return None
+
+  model_candidates = []
+  for model in loaded_fp.Models():
+    src = Path(resolve_env_path(str(model.m_Filename), project_root))
+    if src.suffix.lower() in MODEL_EXT_PRIORITY and src.exists():
+      model_candidates.append(src)
+
+  return pick_preferred_model_path(model_candidates)
+
+
+def count_localized_model_refs(board):
+  localized_prefix = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/"
+  localized_refs = 0
+
+  for fp in board.GetFootprints():
+    for model in fp.Models():
+      if str(model.m_Filename).startswith(localized_prefix):
+        localized_refs += 1
+
+  return localized_refs
+
+
+def map_component_models_from_board(board, reference_to_component):
+  component_model_candidates = {}
+
+  for fp in board.GetFootprints():
+    ref = str(fp.GetReference()).strip()
+    component_name = reference_to_component.get(ref)
+    if not component_name:
+      continue
 
     for model in fp.Models():
       src = Path(resolve_env_path(str(model.m_Filename)))
       ext = src.suffix.lower()
-      if ext in [".step", ".stp"] and src.exists():
-        step_path = src
-        break
+      if ext in MODEL_EXT_PRIORITY and src.exists():
+        component_model_candidates.setdefault(component_name, []).append(src)
 
-    if step_path and footprint_name not in model_paths:
-      model_paths[footprint_name] = step_path
+  component_model_map = {}
+  for component_name, candidates in component_model_candidates.items():
+    best = pick_preferred_model_path(candidates)
+    if best is not None:
+      component_model_map[component_name] = best
 
-  return model_paths
+  return component_model_map
 
 
 def map_component_footprints_from_board(board, reference_to_component, components):
@@ -389,6 +645,7 @@ def export_component_files(
   symbol_map,
   footprint_map,
   model_paths,
+  component_model_map,
   component_to_footprint_fallback,
   logger,
 ):
@@ -404,12 +661,15 @@ def export_component_files(
     "footprint_from_board_fallback": 0,
     "exported_symbol": 0,
     "exported_footprint": 0,
-    "exported_step": 0,
+    "exported_model": 0,
+    "step_from_fp_library": 0,
+    "model_from_component_board_map": 0,
   }
 
   for component_name in sorted(components.keys()):
     info = components[component_name]
     footprint_name = info["footprint"]
+    footprint_full = info.get("footprint_full", "")
     if not footprint_name:
       fallback_name = component_to_footprint_fallback.get(component_name, "")
       if fallback_name:
@@ -429,8 +689,12 @@ def export_component_files(
     footprint_path = component_dir / f"{component_name}.kicad_mod"
 
     if not footprint_name:
-      logger.warn(f"footprint property missing for component '{component_name}'")
+      logger.info(
+        f"skipping schematic-only component '{component_name}' "
+        "because it has no footprint"
+      )
       stats["missing_footprint_name"] += 1
+      continue
     else:
       footprint_block = footprint_map.get(footprint_name)
       if footprint_block is None:
@@ -440,17 +704,18 @@ def export_component_files(
           footprint_name = component_name
       if footprint_block is None:
         logger.warn(
-          f"footprint definition not found for component '{component_name}'"
-          f" (footprint '{footprint_name}')"
+          f"skipping component '{component_name}' because footprint definition "
+          f"'{footprint_name}' was not found on the board"
         )
         stats["missing_footprint_definition"] += 1
+        continue
       else:
         mod_text = normalize_footprint_block_name(footprint_block, component_name) + "\n"
         footprint_path.write_text(mod_text, encoding="utf-8")
         has_footprint = True
         stats["exported_footprint"] += 1
 
-    symbol_footprint_ref = f"{LOCAL_LIB}:{component_name}" if has_footprint else ""
+    symbol_footprint_ref = f"{LOCAL_LIB}:{component_name}"
     symbol_block_out = rewrite_symbol_footprint_property(symbol_block, symbol_footprint_ref)
     symbol_text = (
       "(kicad_symbol_lib (version 20211014) (generator localizer)\n"
@@ -460,21 +725,34 @@ def export_component_files(
     (component_dir / f"{component_name}.kicad_sym").write_text(symbol_text, encoding="utf-8")
     stats["exported_symbol"] += 1
 
-    step_src = model_paths.get(footprint_name)
-    if step_src is None:
-      step_src = model_paths.get(component_name)
-    has_step = False
-    if step_src is not None:
-      step_dst = component_dir / f"{component_name}.step"
-      shutil.copy2(step_src, step_dst)
-      has_step = True
-      stats["exported_step"] += 1
+    model_src = component_model_map.get(component_name)
+    if model_src is not None:
+      stats["model_from_component_board_map"] += 1
+    if model_src is None:
+      model_src = model_paths.get(footprint_name)
+    if model_src is None:
+      model_src = model_paths.get(component_name)
+    if model_src is None and footprint_full:
+      model_src = resolve_model_from_footprint_library(footprint_full, root)
+      if model_src is not None:
+        stats["step_from_fp_library"] += 1
+
+    has_model = False
+    model_ext = ""
+    model_path = None
+    if model_src is not None:
+      model_ext = model_src.suffix.lower()
+      model_path = component_dir / f"{component_name}{model_ext}"
+      shutil.copy2(model_src, model_path)
+      has_model = True
+      stats["exported_model"] += 1
 
     exported[component_name] = {
       "symbol": component_dir / f"{component_name}.kicad_sym",
       "footprint": footprint_path,
-      "step": component_dir / f"{component_name}.step",
-      "has_step": has_step,
+      "model": model_path,
+      "model_ext": model_ext,
+      "has_model": has_model,
       "has_footprint": has_footprint,
     }
 
@@ -529,26 +807,31 @@ def build_combined_3d_directory(root, exported_components):
   out_dir = root / LOCAL_LIBS_DIR / "3d"
   out_dir.mkdir(parents=True, exist_ok=True)
 
-  has_step = set()
+  model_ext_by_component = {}
   for component_name in sorted(exported_components.keys()):
-    if not exported_components[component_name]["has_step"]:
+    if not exported_components[component_name]["has_model"]:
       continue
 
-    src = exported_components[component_name]["step"]
-    dst = out_dir / f"{component_name}.step"
+    src = exported_components[component_name]["model"]
+    ext = exported_components[component_name]["model_ext"]
+    dst = out_dir / f"{component_name}{ext}"
     shutil.copy2(src, dst)
-    has_step.add(component_name)
+    model_ext_by_component[component_name] = ext
 
-  return out_dir, has_step
+  return out_dir, model_ext_by_component
 
 
 def rewrite_schematic(sch_path, footprint_to_component, exported_names):
   content = sch_path.read_text(encoding="utf-8")
+  rewritten_lib_ids = 0
+  rewritten_footprints = 0
 
   def rewrite_lib_id(match):
+    nonlocal rewritten_lib_ids
     item_name = match.group(2)
     if item_name not in exported_names:
       return match.group(0)  # leave untouched (power symbols, etc.)
+    rewritten_lib_ids += 1
     return f'(lib_id "{LOCAL_LIB}:{item_name}")'
 
   content = re.sub(
@@ -557,24 +840,13 @@ def rewrite_schematic(sch_path, footprint_to_component, exported_names):
     content,
   )
 
-  def rewrite_symbol_definition_name(match):
-    item_name = match.group(2)
-    if item_name not in exported_names:
-      return match.group(0)  # leave untouched (power/device symbols, etc.)
-    return f'(symbol "{LOCAL_LIB}:{item_name}"'
-
-  # Keep in-file cached symbol definitions aligned with rewritten lib_id entries.
-  content = re.sub(
-    r'\(symbol\s+"([^"]+):([^"]+)"',
-    rewrite_symbol_definition_name,
-    content,
-  )
-
   def rewrite_footprint_property(match):
+    nonlocal rewritten_footprints
     base_name = match.group(2)
     component_name = footprint_to_component.get(base_name, base_name)
     if component_name not in exported_names:
       return match.group(0)  # leave untouched
+    rewritten_footprints += 1
     return f'(property "Footprint" "{LOCAL_LIB}:{component_name}"'
 
   content = re.sub(
@@ -584,16 +856,121 @@ def rewrite_schematic(sch_path, footprint_to_component, exported_names):
   )
 
   sch_path.write_text(content, encoding="utf-8")
+  return {
+    "lib_ids": rewritten_lib_ids,
+    "footprints": rewritten_footprints,
+  }
 
 
-def rewrite_board(board, root, footprint_to_component):
-  step_dir = root / LOCAL_LIBS_DIR / "3d"
-  available_steps = {p.stem for p in step_dir.glob("*.step")}
+def sync_schematic_lib_symbols_from_local_library(root, sch_path, exported_names, logger=None):
+  local_sym_path = root / LOCAL_LIBS_DIR / f"{LOCAL_LIB}.kicad_sym"
+  if not local_sym_path.exists():
+    if logger is not None:
+      logger.warn(f"local symbol library not found: {local_sym_path}")
+    return 0
+
+  sch_content = sch_path.read_text(encoding="utf-8")
+  sch_lib_symbols_block = find_block_by_token(sch_content, "(lib_symbols")
+  if sch_lib_symbols_block is None:
+    if logger is not None:
+      logger.warn("schematic has no lib_symbols block")
+    return 0
+
+  local_content = local_sym_path.read_text(encoding="utf-8")
+  local_root = find_block_by_token(local_content, "(kicad_symbol_lib")
+  if local_root is None:
+    if logger is not None:
+      logger.warn("localLib.kicad_sym has no kicad_symbol_lib root")
+    return 0
+
+  local_symbol_blocks = extract_direct_child_blocks(local_root, "(symbol ")
+  if not local_symbol_blocks:
+    if logger is not None:
+      logger.warn("no top-level symbols found in localLib.kicad_sym")
+    return 0
+
+  existing_blocks = split_top_level_symbols(sch_lib_symbols_block)
+  preserved_blocks = []
+  for block in existing_blocks:
+    block_name = get_symbol_block_name(block)
+    if block_name is None:
+      continue
+
+    local_name = block_name.split(":")[-1]
+    if local_name in exported_names:
+      continue
+
+    preserved_blocks.append(block)
+
+  updated_blocks = list(preserved_blocks)
+  for block in local_symbol_blocks:
+    updated_blocks.append(prefix_symbol_block_name(block, LOCAL_LIB))
+
+  new_block_lines = ["(lib_symbols"]
+  for block in updated_blocks:
+    for line in block.splitlines():
+      new_block_lines.append(f"\t\t{line}")
+  new_block_lines.append("\t)")
+  new_lib_symbols_block = "\n".join(new_block_lines)
+
+  updated_content = sch_content.replace(sch_lib_symbols_block, new_lib_symbols_block, 1)
+  sch_path.write_text(updated_content, encoding="utf-8")
+  return len(local_symbol_blocks)
+
+
+def upsert_project_lib_table(table_path, table_type, name, uri):
+  if table_type == "sym":
+    root_token = "sym_lib_table"
+  else:
+    root_token = "fp_lib_table"
+
+  lib_entry = (
+    f'  (lib (name "{name}")\n'
+    f'    (type "KiCad")\n'
+    f'    (uri "{uri}")\n'
+    "  )\n"
+  )
+
+  if table_path.exists():
+    content = table_path.read_text(encoding="utf-8")
+  else:
+    content = f"({root_token}\n)\n"
+
+  if re.search(r'\(lib\s+\(name\s+"' + re.escape(name) + r'"\)', content):
+    # Replace existing entry for this library name.
+    pattern = (
+      r'\(lib\s+\(name\s+"' + re.escape(name) + r'"\)'  # start of target lib
+      r'(?:\s|\n)*\(type\s+"[^"]+"\)'
+      r'(?:\s|\n)*\(uri\s+"[^"]+"\)'
+      r'(?:\s|\n)*\)'
+    )
+    content = re.sub(pattern, lib_entry.rstrip(), content, count=1)
+  else:
+    # Insert before final ')' of table root.
+    idx = content.rfind(")")
+    if idx == -1:
+      content = f"({root_token}\n{lib_entry})\n"
+    else:
+      content = content[:idx] + lib_entry + content[idx:]
+
+  table_path.write_text(content, encoding="utf-8")
+
+
+def rewrite_board(board, root, footprint_to_component, localized_names):
+  model_dir = root / LOCAL_LIBS_DIR / "3d"
+  model_ext_by_component = {
+    p.stem: p.suffix.lower()
+    for p in model_dir.glob("*")
+    if p.is_file() and p.suffix.lower() in MODEL_EXT_PRIORITY
+  }
   changed_models = 0
 
   for fp in board.GetFootprints():
     old_name = str(fp.GetFPID().GetLibItemName())
     component_name = footprint_to_component.get(old_name, old_name)
+
+    if component_name not in localized_names:
+      continue
 
     fp.SetFPID(pcbnew.LIB_ID(LOCAL_LIB, component_name))
 
@@ -606,17 +983,19 @@ def rewrite_board(board, root, footprint_to_component):
     for i in range(model_count):
       model = models[i]
       target_name = component_name
+      target_ext = model_ext_by_component.get(target_name)
 
-      # Fallback: if the mapped component has no STEP, reuse model basename when possible.
-      if target_name not in available_steps:
+      # Fallback: if the mapped component has no model, reuse model basename when possible.
+      if target_ext is None:
         model_path = str(model.m_Filename).replace('\\', '/')
         basename = model_path.rsplit('/', 1)[-1]
         stem = basename.rsplit('.', 1)[0] if '.' in basename else basename
-        if stem in available_steps:
+        if stem in model_ext_by_component:
           target_name = stem
+          target_ext = model_ext_by_component.get(stem)
 
-      if target_name in available_steps:
-        new_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{target_name}.step"
+      if target_ext is not None:
+        new_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{target_name}{target_ext}"
         if str(model.m_Filename) == new_ref:
           continue
         try:
@@ -647,10 +1026,15 @@ def rewrite_board_model_paths_in_file(pcb_path, root):
       return model_ref.split("/", 1)[0]
     return model_ref
 
-  for step_file in sorted((root / LOCAL_LIBS_DIR / "3d").glob("*.step")):
-    component_name = step_file.stem
-    model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}.step"
-    pattern = r'\(model\s+"([^"]*/' + re.escape(component_name) + r'\.(?:step|stp))"'
+  model_files = sorted(
+    [p for p in (root / LOCAL_LIBS_DIR / "3d").glob("*") if p.is_file() and p.suffix.lower() in MODEL_EXT_PRIORITY]
+  )
+
+  for model_file in model_files:
+    component_name = model_file.stem
+    model_ext = model_file.suffix.lower()
+    model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}{model_ext}"
+    pattern = r'\(model\s+"([^"]*/' + re.escape(component_name) + r'\.(?:step|stp|wrl))"'
 
     def repl(match):
       nonlocal changed_lines
@@ -689,11 +1073,17 @@ def rewrite_pretty_model_paths(root):
   for mod_path in pretty_dir.glob("*.kicad_mod"):
     content = mod_path.read_text(encoding="utf-8")
     component_name = mod_path.stem
-    step_path = root / LOCAL_LIBS_DIR / "3d" / f"{component_name}.step"
-    if not step_path.exists():
+    model_path = None
+    for ext in MODEL_EXT_PRIORITY:
+      candidate = root / LOCAL_LIBS_DIR / "3d" / f"{component_name}{ext}"
+      if candidate.exists():
+        model_path = candidate
+        break
+
+    if model_path is None:
       continue
 
-    model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}.step"
+    model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}{model_path.suffix.lower()}"
     pattern = r'\(model\s+"([^"]+)"'
 
     def repl(match):
@@ -793,30 +1183,18 @@ def log_model_ref_summary(logger, root, pcb_path, phase):
 
 
 def ensure_tables(root):
-  (root / "fp-lib-table").write_text(
-    f"""
-(fp_lib_table
-  (lib (name \"{LOCAL_LIB}\")
-    (type \"KiCad\")
-    (uri \"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/{LOCAL_LIB}.pretty\")
-  )
-)
-""".strip()
-    + "\n",
-    encoding="utf-8",
+  upsert_project_lib_table(
+    root / "fp-lib-table",
+    "fp",
+    LOCAL_LIB,
+    f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/{LOCAL_LIB}.pretty",
   )
 
-  (root / "sym-lib-table").write_text(
-    f"""
-(sym_lib_table
-  (lib (name \"{LOCAL_LIB}\")
-    (type \"KiCad\")
-    (uri \"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/{LOCAL_LIB}.kicad_sym\")
-  )
-)
-""".strip()
-    + "\n",
-    encoding="utf-8",
+  upsert_project_lib_table(
+    root / "sym-lib-table",
+    "sym",
+    LOCAL_LIB,
+    f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/{LOCAL_LIB}.kicad_sym",
   )
 
 
@@ -861,13 +1239,24 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
     symbol_map = extract_symbol_definition_map(sch_content)
     footprint_map = extract_footprint_map(pcb_path)
     model_paths = collect_footprint_model_paths(board)
+    component_model_map = map_component_models_from_board(board, reference_to_component)
+    localized_model_refs = count_localized_model_refs(board)
     component_to_footprint_fallback = map_component_footprints_from_board(board, reference_to_component, components)
 
     logger.info(f"used components found: {len(components)}")
     logger.info(f"symbol definitions found: {len(symbol_map)}")
     logger.info(f"unique board footprints found: {len(footprint_map)}")
-    logger.info(f"footprints with STEP models found: {len(model_paths)}")
+    logger.info(f"footprints with 3D models found: {len(model_paths)}")
+    logger.info(f"components with 3D models found from board refs: {len(component_model_map)}")
     logger.info(f"board reference fallback mappings: {len(component_to_footprint_fallback)}")
+
+    if not model_paths and localized_model_refs:
+      logger.error(
+        "no source 3D models could be resolved, but the board already points "
+        f"to {localized_model_refs} localized 3D refs under {LOCAL_LIBS_DIR}/3d; "
+        "the source project copy is likely already localized and missing its "
+        "original 3D model paths"
+      )
 
     if not components:
       logger.error("no used components detected in schematic; aborting")
@@ -881,6 +1270,7 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
       symbol_map,
       footprint_map,
       model_paths,
+      component_model_map,
       component_to_footprint_fallback,
       logger,
     )
@@ -889,7 +1279,12 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
       "export summary: "
       f"symbols={export_stats['exported_symbol']}, "
       f"footprints={export_stats['exported_footprint']}, "
-      f"steps={export_stats['exported_step']}"
+      f"models={export_stats['exported_model']}"
+    )
+    logger.info(f"step source fallback from footprint libraries: {export_stats['step_from_fp_library']}")
+    logger.info(
+      "model source from board-reference mapping: "
+      f"{export_stats['model_from_component_board_map']}"
     )
     logger.info(
       "missing summary: "
@@ -916,11 +1311,23 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
     ensure_tables(root)
 
     logger.info("7) Rewrite schematic library references")
-    rewrite_schematic(sch_path, footprint_to_component, set(exported.keys()))
+    rewrite_stats = rewrite_schematic(sch_path, footprint_to_component, set(exported.keys()))
+    logger.info(
+      "schematic rewritten: "
+      f"lib_ids={rewrite_stats['lib_ids']}, "
+      f"footprints={rewrite_stats['footprints']}"
+    )
+    cache_count = sync_schematic_lib_symbols_from_local_library(
+      root,
+      sch_path,
+      set(exported.keys()),
+      logger,
+    )
+    logger.info(f"schematic lib_symbols cache synced from localLib: {cache_count}")
 
     logger.info("8) Rewrite board footprint and 3D references")
     log_model_ref_summary(logger, root, pcb_path, "before")
-    mem_updates = rewrite_board(board, root, footprint_to_component)
+    mem_updates = rewrite_board(board, root, footprint_to_component, set(exported.keys()))
     logger.info(f"in-memory 3D model entries rewritten: {mem_updates}")
     board.Save(str(pcb_path))
     pretty_models, pretty_transitions = rewrite_pretty_model_paths(root)
@@ -936,7 +1343,7 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
       "SUMMARY "
       f"symbols={export_stats['exported_symbol']} "
       f"footprints={export_stats['exported_footprint']} "
-      f"steps={export_stats['exported_step']} "
+      f"models={export_stats['exported_model']} "
       f"pretty3d={pretty_models} "
       f"pcb3d={changed_models}"
     )
