@@ -16,8 +16,36 @@ except Exception:
 LOCAL_LIB = "localLib"
 LOCAL_LIBS_DIR = "localLibs"
 MODEL_EXT_PRIORITY = [".step", ".stp", ".wrl"]
+REWRITE_SCHEMATIC_REFS = True
+SYNC_SCHEMATIC_LIB_SYMBOLS = False
 
 _PATH_VARS_CACHE = {}
+
+
+def toSafeLocalItemName(raw_name):
+  safe = re.sub(r'[\\/:*?"<>|()\[\]{}\-]+', "_", str(raw_name).strip())
+  safe = re.sub(r'\s+', "_", safe)
+  safe = re.sub(r'_+', "_", safe).strip("._")
+  return safe if safe else "component"
+
+
+def makeUniqueLocalItemName(raw_name, used_names):
+  base = toSafeLocalItemName(raw_name)
+  candidate = base
+  index = 2
+  while candidate in used_names:
+    candidate = f"{base}_{index}"
+    index += 1
+  used_names.add(candidate)
+  return candidate
+
+
+def buildUniqueNameMap(raw_names):
+  used = set()
+  mapped = {}
+  for raw_name in sorted(raw_names):
+    mapped[raw_name] = makeUniqueLocalItemName(raw_name, used)
+  return mapped
 
 
 def parseVersionKey(path_obj):
@@ -71,7 +99,28 @@ def discoverKicadInstallPathVars():
     if three_d.exists():
       if major:
         discovered.setdefault(f"KICAD{major}_3DMODEL_DIR", str(three_d))
+      # Some projects still reference legacy KiCad version vars (e.g. KICAD6_3DMODEL_DIR)
+      # even when running newer KiCad versions.
+      for legacy_major in ("6", "7", "8", "9"):
+        discovered.setdefault(f"KICAD{legacy_major}_3DMODEL_DIR", str(three_d))
       discovered.setdefault("KISYS3DMOD", str(three_d))
+
+  return discovered
+
+
+def discoverUserLibraryPathVars():
+  discovered = {}
+  candidates = [
+    Path(os.path.expanduser("~/Documents/KiCAD/myLibraries")),
+    Path(os.path.expanduser("~/Documents/KiCad/myLibraries")),
+    Path(os.path.expanduser("~/Documents/KiCAD/MyLibraries")),
+    Path(os.path.expanduser("~/Documents/KiCad/MyLibraries")),
+  ]
+
+  for candidate in candidates:
+    if candidate.exists():
+      discovered.setdefault("MYLIBRARIES", str(candidate))
+      break
 
   return discovered
 
@@ -107,6 +156,7 @@ def getPathVars(project_root=None):
   path_vars.update(os.environ)
   path_vars.update(loadKicadCommonPathVars())
   path_vars.update(discoverKicadInstallPathVars())
+  path_vars.update(discoverUserLibraryPathVars())
   path_vars.update(loadProjectTextVars(project_root))
 
   _PATH_VARS_CACHE[key] = path_vars
@@ -319,10 +369,24 @@ def prefixSymbolBlockName(symbol_block, library_name):
 def normalizeSymbolBlockName(symbol_block, symbol_name):
   # Normalize every symbol declaration in the block to local names without
   # library prefixes (e.g. Device:R_0_1 -> R_0_1).
+  top_level_match = re.match(r'\(symbol\s+"([^"]+)"', symbol_block)
+  if top_level_match is None:
+    return symbol_block
+
+  original_root = top_level_match.group(1).split(":")[-1]
+
   def repl(match):
     raw_name = match.group(1)
     local_name = raw_name.split(":")[-1]
-    return f'(symbol "{local_name}"'
+
+    if local_name == original_root:
+      target_name = symbol_name
+    elif local_name.startswith(original_root + "_"):
+      target_name = symbol_name + local_name[len(original_root):]
+    else:
+      target_name = toSafeLocalItemName(local_name)
+
+    return f'(symbol "{target_name}"'
 
   normalized = re.sub(
     r'\(symbol\s+"([^"]+)"',
@@ -535,6 +599,52 @@ def pickPreferredModelPath(model_candidates):
   return Path(model_candidates[0])
 
 
+def preferStepSibling(model_path):
+  model_path = Path(model_path)
+  if not model_path.exists():
+    return None
+
+  if model_path.suffix.lower() in (".step", ".stp"):
+    return model_path
+
+  step_candidate = model_path.with_suffix(".step")
+  if step_candidate.exists():
+    return step_candidate
+
+  stp_candidate = model_path.with_suffix(".stp")
+  if stp_candidate.exists():
+    return stp_candidate
+
+  return model_path
+
+
+def collectSiblingModelVariants(model_path):
+  model_path = Path(model_path)
+  if not model_path.exists():
+    return []
+
+  variants = []
+  for ext in MODEL_EXT_PRIORITY:
+    candidate = model_path.with_suffix(ext)
+    if candidate.exists():
+      variants.append(candidate)
+
+  # If none of the preferred extensions exists, keep original path.
+  if not variants:
+    variants.append(model_path)
+
+  unique = []
+  seen = set()
+  for p in variants:
+    key = str(p)
+    if key in seen:
+      continue
+    seen.add(key)
+    unique.append(p)
+
+  return unique
+
+
 def collectFootprintModelPaths(board):
   model_paths = {}
 
@@ -546,7 +656,9 @@ def collectFootprintModelPaths(board):
       src = Path(resolveEnvPath(str(model.m_Filename), Path(board.GetFileName()).parent))
       ext = src.suffix.lower()
       if ext in MODEL_EXT_PRIORITY and src.exists():
-        model_candidates.append(src)
+        preferred = preferStepSibling(src)
+        if preferred is not None:
+          model_candidates.append(preferred)
 
     best_model = pickPreferredModelPath(model_candidates)
     if best_model is not None and footprint_name not in model_paths:
@@ -572,7 +684,22 @@ def resolveModelFromFootprintLibrary(footprint_ref, project_root):
   for model in loaded_fp.Models():
     src = Path(resolveEnvPath(str(model.m_Filename), project_root))
     if src.suffix.lower() in MODEL_EXT_PRIORITY and src.exists():
-      model_candidates.append(src)
+      preferred = preferStepSibling(src)
+      if preferred is not None:
+        model_candidates.append(preferred)
+
+  return pickPreferredModelPath(model_candidates)
+
+
+def resolveModelFromFootprintBlock(footprint_block, project_root):
+  model_candidates = []
+  for model_ref in re.findall(r'\(model\s+"([^"]+)"', footprint_block):
+    src = Path(resolveEnvPath(model_ref, project_root))
+    ext = src.suffix.lower()
+    if ext in MODEL_EXT_PRIORITY and src.exists():
+      preferred = preferStepSibling(src)
+      if preferred is not None:
+        model_candidates.append(preferred)
 
   return pickPreferredModelPath(model_candidates)
 
@@ -589,7 +716,7 @@ def countLocalizedModelRefs(board):
   return localized_refs
 
 
-def mapComponentModelsFromBoard(board, reference_to_component):
+def mapComponentModelsFromBoard(board, reference_to_component, project_root=None):
   component_model_candidates = {}
 
   for fp in board.GetFootprints():
@@ -599,10 +726,12 @@ def mapComponentModelsFromBoard(board, reference_to_component):
       continue
 
     for model in fp.Models():
-      src = Path(resolveEnvPath(str(model.m_Filename)))
+      src = Path(resolveEnvPath(str(model.m_Filename), project_root))
       ext = src.suffix.lower()
       if ext in MODEL_EXT_PRIORITY and src.exists():
-        component_model_candidates.setdefault(component_name, []).append(src)
+        preferred = preferStepSibling(src)
+        if preferred is not None:
+          component_model_candidates.setdefault(component_name, []).append(preferred)
 
   component_model_map = {}
   for component_name, candidates in component_model_candidates.items():
@@ -644,6 +773,7 @@ def exportComponentFiles(
   components,
   symbol_map,
   footprint_map,
+  footprint_name_map,
   model_paths,
   component_model_map,
   component_to_footprint_fallback,
@@ -653,6 +783,8 @@ def exportComponentFiles(
   components_dir.mkdir(parents=True, exist_ok=True)
 
   exported = {}
+  component_name_map = {}
+  used_local_names = set()
   stats = {
     "components_requested": len(components),
     "missing_symbol_definition": 0,
@@ -667,6 +799,11 @@ def exportComponentFiles(
   }
 
   for component_name in sorted(components.keys()):
+    local_name = makeUniqueLocalItemName(component_name, used_local_names)
+    component_name_map[component_name] = local_name
+    if local_name != component_name:
+      logger.warn(f"component '{component_name}' will be localized as '{local_name}'")
+
     info = components[component_name]
     footprint_name = info["footprint"]
     footprint_full = info.get("footprint_full", "")
@@ -682,11 +819,12 @@ def exportComponentFiles(
       stats["missing_symbol_definition"] += 1
       continue
 
-    component_dir = components_dir / component_name
+    component_dir = components_dir / local_name
     component_dir.mkdir(parents=True, exist_ok=True)
 
     has_footprint = False
-    footprint_path = component_dir / f"{component_name}.kicad_mod"
+    local_footprint_name = local_name
+    footprint_path = component_dir / f"{local_footprint_name}.kicad_mod"
 
     if not footprint_name:
       logger.info(
@@ -710,19 +848,22 @@ def exportComponentFiles(
         stats["missing_footprint_definition"] += 1
         continue
       else:
-        mod_text = normalizeFootprintBlockName(footprint_block, component_name) + "\n"
+        local_footprint_name = footprint_name_map.get(footprint_name, local_name)
+        footprint_path = component_dir / f"{local_footprint_name}.kicad_mod"
+        mod_text = normalizeFootprintBlockName(footprint_block, local_footprint_name) + "\n"
         footprint_path.write_text(mod_text, encoding="utf-8")
         has_footprint = True
         stats["exported_footprint"] += 1
 
-    symbol_footprint_ref = f"{LOCAL_LIB}:{component_name}"
-    symbol_block_out = rewriteSymbolFootprintProperty(symbol_block, symbol_footprint_ref)
+    symbol_block_local = normalizeSymbolBlockName(symbol_block, local_name)
+    symbol_footprint_ref = f"{LOCAL_LIB}:{local_footprint_name}"
+    symbol_block_out = rewriteSymbolFootprintProperty(symbol_block_local, symbol_footprint_ref)
     symbol_text = (
       "(kicad_symbol_lib (version 20211014) (generator localizer)\n"
       f"  {symbol_block_out}\n"
       ")\n"
     )
-    (component_dir / f"{component_name}.kicad_sym").write_text(symbol_text, encoding="utf-8")
+    (component_dir / f"{local_name}.kicad_sym").write_text(symbol_text, encoding="utf-8")
     stats["exported_symbol"] += 1
 
     model_src = component_model_map.get(component_name)
@@ -736,27 +877,61 @@ def exportComponentFiles(
       model_src = resolveModelFromFootprintLibrary(footprint_full, root)
       if model_src is not None:
         stats["step_from_fp_library"] += 1
+    if model_src is None and footprint_block is not None:
+      model_src = resolveModelFromFootprintBlock(footprint_block, root)
+      if model_src is not None:
+        stats["step_from_fp_library"] += 1
 
     has_model = False
     model_ext = ""
     model_path = None
+    model_variants = []
     if model_src is not None:
-      model_ext = model_src.suffix.lower()
-      model_path = component_dir / f"{component_name}{model_ext}"
-      shutil.copy2(model_src, model_path)
+      source_variants = collectSiblingModelVariants(model_src)
+      copied_variants = []
+      for src_variant in source_variants:
+        ext = src_variant.suffix.lower()
+        dst_variant = component_dir / f"{local_name}{ext}"
+        shutil.copy2(src_variant, dst_variant)
+        copied_variants.append(dst_variant)
+
+      preferred_src = pickPreferredModelPath(source_variants)
+      model_ext = preferred_src.suffix.lower() if preferred_src is not None else ""
+      model_path = component_dir / f"{local_name}{model_ext}" if model_ext else None
+      model_variants = copied_variants
       has_model = True
       stats["exported_model"] += 1
 
     exported[component_name] = {
-      "symbol": component_dir / f"{component_name}.kicad_sym",
+      "symbol": component_dir / f"{local_name}.kicad_sym",
       "footprint": footprint_path,
       "model": model_path,
+      "model_variants": model_variants,
       "model_ext": model_ext,
       "has_model": has_model,
       "has_footprint": has_footprint,
+      "local_name": local_name,
+      "local_footprint_name": local_footprint_name,
     }
 
-  return exported, stats
+  return exported, stats, component_name_map
+
+
+def collectAllBoardModelSourceFiles(board, root):
+  source_files = {}
+
+  for fp in board.GetFootprints():
+    for model in fp.Models():
+      resolved = Path(resolveEnvPath(str(model.m_Filename), root))
+      ext = resolved.suffix.lower()
+      if ext not in MODEL_EXT_PRIORITY or not resolved.exists():
+        continue
+
+      for variant in collectSiblingModelVariants(resolved):
+        key = f"{variant.stem}{variant.suffix.lower()}"
+        source_files.setdefault(key, variant)
+
+  return list(source_files.values())
 
 
 def buildCombinedSymbolLibrary(root, logger=None):
@@ -797,13 +972,32 @@ def buildCombinedFootprintLibrary(root, exported_components):
       continue
 
     src = exported_components[component_name]["footprint"]
-    dst = fp_dir / f"{component_name}.kicad_mod"
+    local_name = exported_components[component_name].get("local_name", component_name)
+    dst = fp_dir / f"{local_name}.kicad_mod"
     shutil.copy2(src, dst)
 
   return fp_dir
 
 
-def buildCombined3dDirectory(root, exported_components):
+def exportAllBoardFootprintsToLocalLibrary(root, footprint_map, footprint_name_map):
+  fp_dir = root / LOCAL_LIBS_DIR / f"{LOCAL_LIB}.pretty"
+  fp_dir.mkdir(parents=True, exist_ok=True)
+
+  written = 0
+  for original_name, footprint_block in sorted(footprint_map.items()):
+    local_name = footprint_name_map.get(original_name)
+    if not local_name:
+      continue
+
+    dst = fp_dir / f"{local_name}.kicad_mod"
+    mod_text = normalizeFootprintBlockName(footprint_block, local_name) + "\n"
+    dst.write_text(mod_text, encoding="utf-8")
+    written += 1
+
+  return written
+
+
+def buildCombined3dDirectory(root, exported_components, board=None):
   out_dir = root / LOCAL_LIBS_DIR / "3d"
   out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -812,54 +1006,194 @@ def buildCombined3dDirectory(root, exported_components):
     if not exported_components[component_name]["has_model"]:
       continue
 
-    src = exported_components[component_name]["model"]
+    local_name = exported_components[component_name].get("local_name", component_name)
+
+    variants = exported_components[component_name].get("model_variants") or []
+    for src_variant in variants:
+      ext = src_variant.suffix.lower()
+      dst_variant = out_dir / f"{local_name}{ext}"
+      shutil.copy2(src_variant, dst_variant)
+
     ext = exported_components[component_name]["model_ext"]
-    dst = out_dir / f"{component_name}{ext}"
-    shutil.copy2(src, dst)
-    model_ext_by_component[component_name] = ext
+    if ext:
+      model_ext_by_component[local_name] = ext
+
+  if board is not None:
+    for src in collectAllBoardModelSourceFiles(board, root):
+      dst = out_dir / src.name
+      if not dst.exists():
+        shutil.copy2(src, dst)
 
   return out_dir, model_ext_by_component
 
 
-def rewriteSchematic(sch_path, footprint_to_component, exported_names):
+def rewriteSchematic(sch_path, component_name_map, footprint_name_map):
   content = sch_path.read_text(encoding="utf-8")
   rewritten_lib_ids = 0
   rewritten_footprints = 0
+  rewritten_lib_symbols = 0
+  rewritten_cache_footprints = 0
+  rewritten_cache_sanitized = 0
+
+  lib_symbols_block = findBlockByToken(content, "(lib_symbols")
+  placeholder = "__LIB_SYMBOLS_BLOCK__"
+  if lib_symbols_block is not None:
+    working_content = content.replace(lib_symbols_block, placeholder, 1)
+  else:
+    working_content = content
 
   def rewriteLibId(match):
     nonlocal rewritten_lib_ids
+    lib_name = match.group(1)
+    if lib_name == "power":
+      return match.group(0)
     item_name = match.group(2)
-    if item_name not in exported_names:
+    local_name = component_name_map.get(item_name)
+    if local_name is None:
       return match.group(0)  # leave untouched (power symbols, etc.)
     rewritten_lib_ids += 1
-    return f'(lib_id "{LOCAL_LIB}:{item_name}")'
+    return f'(lib_id "{LOCAL_LIB}:{local_name}")'
 
-  content = re.sub(
+  working_content = re.sub(
     r'\(lib_id\s+"([^"]+):([^"]+)"\)',
     rewriteLibId,
-    content,
+    working_content,
   )
 
   def rewriteFootprintProperty(match):
     nonlocal rewritten_footprints
-    base_name = match.group(2)
-    component_name = footprint_to_component.get(base_name, base_name)
-    if component_name not in exported_names:
+    footprint_ref = match.group(2)
+    _, base_name = splitFootprintReference(footprint_ref)
+    base_name = base_name or footprint_ref
+    local_name = footprint_name_map.get(base_name)
+    if local_name is None:
       return match.group(0)  # leave untouched
     rewritten_footprints += 1
-    return f'(property "Footprint" "{LOCAL_LIB}:{component_name}"'
+    return f'{match.group(1)}{LOCAL_LIB}:{local_name}{match.group(3)}'
 
-  content = re.sub(
-    r'\(property\s+"Footprint"\s+"([^"]+):([^"]+)"',
+  working_content = re.sub(
+    r'(\(property\s+"Footprint"\s+")([^"]*)(")',
     rewriteFootprintProperty,
-    content,
+    working_content,
   )
+
+  if lib_symbols_block is not None:
+    cache_block = lib_symbols_block
+
+    # Keep lib_symbols cache aligned with localized instance refs.
+    def rewriteCacheSymbolName(match):
+      nonlocal rewritten_lib_symbols
+      lib_name = match.group(1)
+      item_name = match.group(2)
+      if lib_name == "power":
+        return match.group(0)
+
+      local_name = component_name_map.get(item_name)
+      if local_name is None:
+        return match.group(0)
+
+      rewritten_lib_symbols += 1
+      return f'(symbol "{LOCAL_LIB}:{local_name}"'
+
+    cache_block = re.sub(
+      r'\(symbol\s+"([^":]+):([^"]+)"',
+      rewriteCacheSymbolName,
+      cache_block,
+    )
+
+    # Localize cached Footprint properties in lib_symbols as well.
+    def rewriteCacheFootprintProperty(match):
+      nonlocal rewritten_cache_footprints
+      footprint_ref = match.group(2)
+      _, base_name = splitFootprintReference(footprint_ref)
+      base_name = base_name or footprint_ref
+      local_name = footprint_name_map.get(base_name)
+      if local_name is None:
+        return match.group(0)
+      rewritten_cache_footprints += 1
+      return f'{match.group(1)}{LOCAL_LIB}:{local_name}{match.group(3)}'
+
+    cache_block = re.sub(
+      r'(\(property\s+"Footprint"\s+")([^"]*)(")',
+      rewriteCacheFootprintProperty,
+      cache_block,
+    )
+
+    # Targeted sanitize for known unsafe cached ESP32 symbol names.
+    sanitize_replacements = [
+      (
+        '(symbol "MyNewLibrary:ESP32-WROVER-B/E_(PSRAM)"',
+        '(symbol "localLib:ESP32_WROVER_B_E_PSRAM"',
+      ),
+      (
+        '(property "Footprint" "MyNewLibrary:ESP32-WROVER-B-E_(PSRAM)"',
+        '(property "Footprint" "localLib:ESP32_WROVER_B_E_PSRAM"',
+      ),
+      (
+        '(symbol "ESP32-WROVER-B/E_(PSRAM)_0_0"',
+        '(symbol "ESP32_WROVER_B_E_PSRAM_0_0"',
+      ),
+    ]
+
+    for old_text, new_text in sanitize_replacements:
+      if old_text in cache_block:
+        rewritten_cache_sanitized += cache_block.count(old_text)
+        cache_block = cache_block.replace(old_text, new_text)
+
+    lib_symbols_block = cache_block
+
+  if lib_symbols_block is not None:
+    content = working_content.replace(placeholder, lib_symbols_block, 1)
+  else:
+    content = working_content
 
   sch_path.write_text(content, encoding="utf-8")
   return {
     "lib_ids": rewritten_lib_ids,
     "footprints": rewritten_footprints,
+    "lib_symbols": rewritten_lib_symbols,
+    "cache_footprints": rewritten_cache_footprints,
+    "cache_sanitized": rewritten_cache_sanitized,
   }
+
+
+def removeLibTableEntriesByName(table_path, names_to_remove):
+  if not table_path.exists():
+    return 0
+
+  content = table_path.read_text(encoding="utf-8")
+  updated = content
+  removed = 0
+  scan_index = 0
+
+  while True:
+    start = updated.find("(lib ", scan_index)
+    if start == -1:
+      break
+
+    block = findBalancedBlock(updated, start)
+    if block is None:
+      break
+
+    matched_name = None
+    for lib_name in names_to_remove:
+      if re.search(r'\(name\s+"' + re.escape(lib_name) + r'"\)', block):
+        matched_name = lib_name
+        break
+
+    if matched_name is None:
+      scan_index = start + len(block)
+      continue
+
+    updated = updated[:start] + updated[start + len(block):]
+    removed += 1
+    scan_index = 0
+
+  if updated != content:
+    updated = re.sub(r'\n{3,}', '\n\n', updated)
+    table_path.write_text(updated, encoding="utf-8")
+
+  return removed
 
 
 def syncSchematicLibSymbolsFromLocalLibrary(root, sch_path, exported_names, logger=None):
@@ -956,7 +1290,10 @@ def upsertProjectLibTable(table_path, table_type, name, uri):
   table_path.write_text(content, encoding="utf-8")
 
 
-def rewriteBoard(board, root, footprint_to_component, localized_names):
+def rewriteBoard(board, root, footprint_name_map, reference_to_component, component_name_map):
+  out_dir = root / LOCAL_LIBS_DIR / "3d"
+  out_dir.mkdir(parents=True, exist_ok=True)
+
   model_dir = root / LOCAL_LIBS_DIR / "3d"
   model_ext_by_component = {
     p.stem: p.suffix.lower()
@@ -967,12 +1304,16 @@ def rewriteBoard(board, root, footprint_to_component, localized_names):
 
   for fp in board.GetFootprints():
     old_name = str(fp.GetFPID().GetLibItemName())
-    component_name = footprint_to_component.get(old_name, old_name)
+    local_footprint_name = footprint_name_map.get(old_name)
+    if local_footprint_name is not None:
+      fp.SetFPID(pcbnew.LIB_ID(LOCAL_LIB, local_footprint_name))
 
-    if component_name not in localized_names:
-      continue
+    ref = str(fp.GetReference()).strip()
+    component_name = reference_to_component.get(ref)
+    if not component_name:
+      component_name = old_name
 
-    fp.SetFPID(pcbnew.LIB_ID(LOCAL_LIB, component_name))
+    local_name = component_name_map.get(component_name)
 
     models = fp.Models()
     try:
@@ -982,17 +1323,33 @@ def rewriteBoard(board, root, footprint_to_component, localized_names):
 
     for i in range(model_count):
       model = models[i]
-      target_name = component_name
+      model_ref = str(model.m_Filename)
+      basename = model_ref.replace('\\', '/').rsplit('/', 1)[-1]
+      stem = basename.rsplit('.', 1)[0] if '.' in basename else basename
+      ext = Path(basename).suffix.lower()
+
+      target_name = local_name if local_name else stem
       target_ext = model_ext_by_component.get(target_name)
 
       # Fallback: if the mapped component has no model, reuse model basename when possible.
       if target_ext is None:
-        model_path = str(model.m_Filename).replace('\\', '/')
-        basename = model_path.rsplit('/', 1)[-1]
-        stem = basename.rsplit('.', 1)[0] if '.' in basename else basename
         if stem in model_ext_by_component:
           target_name = stem
           target_ext = model_ext_by_component.get(stem)
+
+      # Final fallback: always localize reference using component local name.
+      if target_ext is None:
+        resolved = Path(resolveEnvPath(model_ref, root))
+        if resolved.exists() and ext in MODEL_EXT_PRIORITY:
+          dst = out_dir / f"{target_name}{ext}"
+          if not dst.exists():
+            try:
+              shutil.copy2(resolved, dst)
+            except Exception:
+              pass
+          target_ext = ext
+        else:
+          target_ext = ext if ext in MODEL_EXT_PRIORITY else ".step"
 
       if target_ext is not None:
         new_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{target_name}{target_ext}"
@@ -1060,6 +1417,7 @@ def rewritePrettyModelPaths(root):
 
   changed_lines = 0
   transitions = {}
+  local_3d_dir = root / LOCAL_LIBS_DIR / "3d"
 
   def modelLibName(model_ref):
     if model_ref.startswith("${") and "}/" in model_ref:
@@ -1072,26 +1430,58 @@ def rewritePrettyModelPaths(root):
 
   for mod_path in pretty_dir.glob("*.kicad_mod"):
     content = mod_path.read_text(encoding="utf-8")
-    component_name = mod_path.stem
-    model_path = None
-    for ext in MODEL_EXT_PRIORITY:
-      candidate = root / LOCAL_LIBS_DIR / "3d" / f"{component_name}{ext}"
-      if candidate.exists():
-        model_path = candidate
-        break
-
-    if model_path is None:
-      continue
-
-    model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{component_name}{model_path.suffix.lower()}"
     pattern = r'\(model\s+"([^"]+)"'
 
     def repl(match):
       nonlocal changed_lines
       old_ref = match.group(1)
+      basename = old_ref.replace('\\', '/').rsplit('/', 1)[-1]
+      stem = basename.rsplit('.', 1)[0] if '.' in basename else basename
+
+      model_path = None
+      for ext in MODEL_EXT_PRIORITY:
+        candidate = local_3d_dir / f"{stem}{ext}"
+        if candidate.exists():
+          model_path = candidate
+          break
+
+      if model_path is None:
+        desired_stem = mod_path.stem
+        for ext in MODEL_EXT_PRIORITY:
+          candidate = local_3d_dir / f"{desired_stem}{ext}"
+          if candidate.exists():
+            model_path = candidate
+            stem = desired_stem
+            break
+
+      # Final fallback: force localLibs path with footprint stem and original ext.
+      if model_path is None:
+        desired_stem = mod_path.stem
+        old_ext = Path(old_ref.replace('\\', '/')).suffix.lower()
+        if old_ext not in MODEL_EXT_PRIORITY:
+          old_ext = ".step"
+
+        resolved_old = Path(resolveEnvPath(old_ref, root))
+        if resolved_old.exists() and resolved_old.suffix.lower() in MODEL_EXT_PRIORITY:
+          target_copy = local_3d_dir / f"{desired_stem}{resolved_old.suffix.lower()}"
+          if not target_copy.exists():
+            try:
+              shutil.copy2(resolved_old, target_copy)
+            except Exception:
+              pass
+          old_ext = resolved_old.suffix.lower()
+
+        model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{desired_stem}{old_ext}"
+        old_lib = modelLibName(old_ref)
+        new_lib = f"KIPRJMOD/{LOCAL_LIBS_DIR}/3d"
+        transitions.setdefault(desired_stem, set()).add((old_lib, new_lib))
+        changed_lines += 1
+        return f'(model "{model_ref}"'
+
+      model_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{stem}{model_path.suffix.lower()}"
       old_lib = modelLibName(old_ref)
       new_lib = f"KIPRJMOD/{LOCAL_LIBS_DIR}/3d"
-      transitions.setdefault(component_name, set()).add((old_lib, new_lib))
+      transitions.setdefault(stem, set()).add((old_lib, new_lib))
       changed_lines += 1
       return f'(model "{model_ref}"'
 
@@ -1183,6 +1573,13 @@ def logModelRefSummary(logger, root, pcb_path, phase):
 
 
 def ensureTables(root):
+  removeLibTableEntriesByName(
+    root / "sym-lib-table",
+    {
+      "esp32-wrover-b:e_(psram)",
+    },
+  )
+
   upsertProjectLibTable(
     root / "fp-lib-table",
     "fp",
@@ -1238,8 +1635,9 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
     sch_content, components, footprint_to_component, reference_to_component = parseUsedComponents(sch_path)
     symbol_map = extractSymbolDefinitionMap(sch_content)
     footprint_map = extractFootprintMap(pcb_path)
+    footprint_name_map = buildUniqueNameMap(footprint_map.keys())
     model_paths = collectFootprintModelPaths(board)
-    component_model_map = mapComponentModelsFromBoard(board, reference_to_component)
+    component_model_map = mapComponentModelsFromBoard(board, reference_to_component, root)
     localized_model_refs = countLocalizedModelRefs(board)
     component_to_footprint_fallback = mapComponentFootprintsFromBoard(board, reference_to_component, components)
 
@@ -1264,11 +1662,12 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
 
     logger.info("2) Export per-component files to components/")
 
-    exported, export_stats = exportComponentFiles(
+    exported, export_stats, component_name_map = exportComponentFiles(
       root,
       components,
       symbol_map,
       footprint_map,
+      footprint_name_map,
       model_paths,
       component_model_map,
       component_to_footprint_fallback,
@@ -1303,31 +1702,42 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
 
     logger.info(f"4) Build {LOCAL_LIBS_DIR}/{LOCAL_LIB}.pretty from components/")
     buildCombinedFootprintLibrary(root, exported)
+    extra_fp_count = exportAllBoardFootprintsToLocalLibrary(root, footprint_map, footprint_name_map)
+    logger.info(f"all board footprints exported to localLib.pretty: {extra_fp_count}")
 
     logger.info(f"5) Build {LOCAL_LIBS_DIR}/3d from components/")
-    buildCombined3dDirectory(root, exported)
+    buildCombined3dDirectory(root, exported, board)
 
     logger.info("6) Write project library tables")
     ensureTables(root)
 
-    logger.info("7) Rewrite schematic library references")
-    rewrite_stats = rewriteSchematic(sch_path, footprint_to_component, set(exported.keys()))
-    logger.info(
-      "schematic rewritten: "
-      f"lib_ids={rewrite_stats['lib_ids']}, "
-      f"footprints={rewrite_stats['footprints']}"
-    )
-    cache_count = syncSchematicLibSymbolsFromLocalLibrary(
-      root,
-      sch_path,
-      set(exported.keys()),
-      logger,
-    )
-    logger.info(f"schematic lib_symbols cache synced from localLib: {cache_count}")
+    if REWRITE_SCHEMATIC_REFS:
+      logger.info("7) Rewrite schematic library references")
+      rewrite_stats = rewriteSchematic(sch_path, component_name_map, footprint_name_map)
+      logger.info(
+        "schematic rewritten: "
+        f"lib_ids={rewrite_stats['lib_ids']}, "
+        f"footprints={rewrite_stats['footprints']}, "
+        f"lib_symbols={rewrite_stats['lib_symbols']}, "
+        f"cache_footprints={rewrite_stats['cache_footprints']}, "
+        f"cache_sanitized={rewrite_stats['cache_sanitized']}"
+      )
+      if SYNC_SCHEMATIC_LIB_SYMBOLS:
+        cache_count = syncSchematicLibSymbolsFromLocalLibrary(
+          root,
+          sch_path,
+          set(exported.keys()),
+          logger,
+        )
+        logger.info(f"schematic lib_symbols cache synced from localLib: {cache_count}")
+      else:
+        logger.info("schematic lib_symbols cache sync skipped (safe mode)")
+    else:
+      logger.info("7) Rewrite schematic library references (skipped in stable mode)")
 
     logger.info("8) Rewrite board footprint and 3D references")
     logModelRefSummary(logger, root, pcb_path, "before")
-    mem_updates = rewriteBoard(board, root, footprint_to_component, set(exported.keys()))
+    mem_updates = rewriteBoard(board, root, footprint_name_map, reference_to_component, component_name_map)
     logger.info(f"in-memory 3D model entries rewritten: {mem_updates}")
     board.Save(str(pcb_path))
     pretty_models, pretty_transitions = rewritePrettyModelPaths(root)

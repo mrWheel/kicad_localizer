@@ -18,14 +18,16 @@ project_root/
     <component>/
       <component>.kicad_sym
       <component>.kicad_mod
-      <component>.step
+      <component>.step (or ".stp" or ".wrl")
 
   localLibs/
     localLib.kicad_sym
     localLib.pretty/
       <component>.kicad_mod
     3d/
-      <component>.step
+      <component1>.step
+      <component2>.wrl
+      <component3>.stp
 
   sym-lib-table
   fp-lib-table
