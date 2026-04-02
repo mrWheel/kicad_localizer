@@ -727,6 +727,35 @@ def resolveModelFromFootprintBlock(footprint_block, project_root):
   return pickPreferredModelPath(model_candidates)
 
 
+def resolvePreferredModelNameFromLocalFootprint(root, footprint_name):
+  footprint_path = root / LOCAL_LIBS_DIR / f"{LOCAL_LIB}.pretty" / f"{footprint_name}.kicad_mod"
+  if not footprint_path.exists():
+    return None
+
+  try:
+    content = footprint_path.read_text(encoding="utf-8")
+  except Exception:
+    return None
+
+  candidates = []
+  for model_ref in re.findall(r'\(model\s+"([^"]+)"', content):
+    basename = model_ref.replace("\\", "/").rsplit("/", 1)[-1]
+    ext = Path(basename).suffix.lower()
+    stem = Path(basename).stem
+    if ext in MODEL_EXT_PRIORITY and stem:
+      candidates.append((stem, ext))
+
+  if not candidates:
+    return None
+
+  for ext in MODEL_EXT_PRIORITY:
+    for stem, candidate_ext in candidates:
+      if candidate_ext == ext:
+        return stem, candidate_ext
+
+  return candidates[0]
+
+
 def countLocalizedModelRefs(board):
   localized_prefix = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/"
   localized_refs = 0
@@ -905,11 +934,13 @@ def exportComponentFiles(
     (component_dir / f"{local_name}.kicad_sym").write_text(symbol_text, encoding="utf-8")
     stats["exported_symbol"] += 1
 
-    model_src = component_model_map.get(component_name)
-    if model_src is not None:
-      stats["model_from_component_board_map"] += 1
+    # Prefer footprint-bound model mapping. A symbol can be reused with multiple
+    # footprints, so component-name model mapping is only a fallback.
+    model_src = model_paths.get(footprint_name)
     if model_src is None:
-      model_src = model_paths.get(footprint_name)
+      model_src = component_model_map.get(component_name)
+      if model_src is not None:
+        stats["model_from_component_board_map"] += 1
     if model_src is None:
       model_src = model_paths.get(component_name)
     if model_src is None and footprint_full:
@@ -1333,7 +1364,7 @@ def upsertProjectLibTable(table_path, table_type, name, uri):
   table_path.write_text(content, encoding="utf-8")
 
 
-def rewriteBoard(board, root, footprint_name_map, reference_to_component, component_name_map):
+def rewriteBoard(board, root, footprint_name_map, reference_to_component, component_name_map, logger=None):
   out_dir = root / LOCAL_LIBS_DIR / "3d"
   out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1344,12 +1375,15 @@ def rewriteBoard(board, root, footprint_name_map, reference_to_component, compon
     if p.is_file() and p.suffix.lower() in MODEL_EXT_PRIORITY
   }
   changed_models = 0
+  logged_model_mappings = set()
 
   for fp in board.GetFootprints():
     old_name = str(fp.GetFPID().GetLibItemName())
     local_footprint_name = footprint_name_map.get(old_name)
     if local_footprint_name is not None:
       fp.SetFPID(pcbnew.LIB_ID(LOCAL_LIB, local_footprint_name))
+    else:
+      local_footprint_name = old_name
 
     ref = str(fp.GetReference()).strip()
     component_name = reference_to_component.get(ref)
@@ -1374,6 +1408,13 @@ def rewriteBoard(board, root, footprint_name_map, reference_to_component, compon
       target_name = local_name if local_name else stem
       target_ext = model_ext_by_component.get(target_name)
 
+      footprint_model = resolvePreferredModelNameFromLocalFootprint(root, local_footprint_name)
+      if footprint_model is not None:
+        fp_model_name, fp_model_ext = footprint_model
+        if (out_dir / f"{fp_model_name}{fp_model_ext}").exists():
+          target_name = fp_model_name
+          target_ext = fp_model_ext
+
       # Fallback: if the mapped component has no model, reuse model basename when possible.
       if target_ext is None:
         if stem in model_ext_by_component:
@@ -1395,6 +1436,11 @@ def rewriteBoard(board, root, footprint_name_map, reference_to_component, compon
           target_ext = ext if ext in MODEL_EXT_PRIORITY else ".step"
 
       if target_ext is not None:
+        mapping_key = (local_footprint_name, target_name, target_ext)
+        if logger is not None and mapping_key not in logged_model_mappings:
+          logger.info(f"footprint {local_footprint_name} -> model {target_name}{target_ext}")
+          logged_model_mappings.add(mapping_key)
+
         new_ref = f"${{KIPRJMOD}}/{LOCAL_LIBS_DIR}/3d/{target_name}{target_ext}"
         if str(model.m_Filename) == new_ref:
           continue
@@ -1822,7 +1868,7 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
 
     logger.info("8) Rewrite board footprint and 3D references")
     logModelRefSummary(logger, root, pcb_path, "before")
-    mem_updates = rewriteBoard(board, root, footprint_name_map, reference_to_component, component_name_map)
+    mem_updates = rewriteBoard(board, root, footprint_name_map, reference_to_component, component_name_map, logger)
     logger.info(f"in-memory 3D model entries rewritten: {mem_updates}")
     board.Save(str(pcb_path))
     pretty_models, pretty_transitions = rewritePrettyModelPaths(root)
