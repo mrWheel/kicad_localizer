@@ -29,6 +29,10 @@ def toSafeLocalItemName(raw_name):
   return safe if safe else "component"
 
 
+def hasUnsafeLocalItemNameChars(raw_name):
+  return bool(re.search(r'[\/()]', str(raw_name)))
+
+
 def makeUniqueLocalItemName(raw_name, used_names):
   base = toSafeLocalItemName(raw_name)
   candidate = base
@@ -796,9 +800,19 @@ def exportComponentFiles(
     "exported_model": 0,
     "step_from_fp_library": 0,
     "model_from_component_board_map": 0,
+    "skipped_unsafe_component_name": 0,
+    "skipped_unsafe_footprint_name": 0,
+    "skipped_unsafe_model_name": 0,
   }
 
   for component_name in sorted(components.keys()):
+    if hasUnsafeLocalItemNameChars(component_name):
+      logger.error(
+        f"skipping symbol '{component_name}' because the name contains invalid characters ('/' or parentheses)"
+      )
+      stats["skipped_unsafe_component_name"] += 1
+      continue
+
     local_name = makeUniqueLocalItemName(component_name, used_local_names)
     component_name_map[component_name] = local_name
     if local_name != component_name:
@@ -832,6 +846,12 @@ def exportComponentFiles(
         "because it has no footprint"
       )
       stats["missing_footprint_name"] += 1
+      continue
+    elif hasUnsafeLocalItemNameChars(footprint_name):
+      logger.error(
+        f"skipping footprint '{footprint_name}' for symbol '{component_name}' because the name contains invalid characters ('/' or parentheses)"
+      )
+      stats["skipped_unsafe_footprint_name"] += 1
       continue
     else:
       footprint_block = footprint_map.get(footprint_name)
@@ -890,17 +910,25 @@ def exportComponentFiles(
       source_variants = collectSiblingModelVariants(model_src)
       copied_variants = []
       for src_variant in source_variants:
+        if hasUnsafeLocalItemNameChars(src_variant.stem):
+          logger.error(
+            f"skipping 3D model '{src_variant.name}' for symbol '{component_name}' because the filename contains invalid characters ('/' or parentheses)"
+          )
+          stats["skipped_unsafe_model_name"] += 1
+          continue
+
         ext = src_variant.suffix.lower()
         dst_variant = component_dir / f"{local_name}{ext}"
         shutil.copy2(src_variant, dst_variant)
         copied_variants.append(dst_variant)
 
-      preferred_src = pickPreferredModelPath(source_variants)
+      preferred_src = pickPreferredModelPath(copied_variants)
       model_ext = preferred_src.suffix.lower() if preferred_src is not None else ""
       model_path = component_dir / f"{local_name}{model_ext}" if model_ext else None
       model_variants = copied_variants
-      has_model = True
-      stats["exported_model"] += 1
+      has_model = bool(copied_variants)
+      if has_model:
+        stats["exported_model"] += 1
 
     exported[component_name] = {
       "symbol": component_dir / f"{local_name}.kicad_sym",
@@ -997,9 +1025,10 @@ def exportAllBoardFootprintsToLocalLibrary(root, footprint_map, footprint_name_m
   return written
 
 
-def buildCombined3dDirectory(root, exported_components, board=None):
+def buildCombined3dDirectory(root, exported_components, board=None, logger=None):
   out_dir = root / LOCAL_LIBS_DIR / "3d"
   out_dir.mkdir(parents=True, exist_ok=True)
+  skipped_unsafe_models = 0
 
   model_ext_by_component = {}
   for component_name in sorted(exported_components.keys()):
@@ -1020,20 +1049,28 @@ def buildCombined3dDirectory(root, exported_components, board=None):
 
   if board is not None:
     for src in collectAllBoardModelSourceFiles(board, root):
+      if hasUnsafeLocalItemNameChars(src.stem):
+        skipped_unsafe_models += 1
+        if logger is not None:
+          logger.error(
+            f"skipping 3D model '{src.name}' because the filename contains invalid characters ('/' or parentheses)"
+          )
+        continue
+
       dst = out_dir / src.name
       if not dst.exists():
         shutil.copy2(src, dst)
 
-  return out_dir, model_ext_by_component
+  return out_dir, model_ext_by_component, skipped_unsafe_models
 
 
-def rewriteSchematic(sch_path, component_name_map, footprint_name_map):
+def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=None):
   content = sch_path.read_text(encoding="utf-8")
   rewritten_lib_ids = 0
   rewritten_footprints = 0
   rewritten_lib_symbols = 0
   rewritten_cache_footprints = 0
-  rewritten_cache_sanitized = 0
+  skipped_unsafe_cache_refs = 0
 
   lib_symbols_block = findBlockByToken(content, "(lib_symbols")
   placeholder = "__LIB_SYMBOLS_BLOCK__"
@@ -1119,26 +1156,26 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map):
       cache_block,
     )
 
-    # Targeted sanitize for known unsafe cached ESP32 symbol names.
-    sanitize_replacements = [
-      (
-        '(symbol "MyNewLibrary:ESP32-WROVER-B/E_(PSRAM)"',
-        '(symbol "localLib:ESP32_WROVER_B_E_PSRAM"',
-      ),
-      (
-        '(property "Footprint" "MyNewLibrary:ESP32-WROVER-B-E_(PSRAM)"',
-        '(property "Footprint" "localLib:ESP32_WROVER_B_E_PSRAM"',
-      ),
-      (
-        '(symbol "ESP32-WROVER-B/E_(PSRAM)_0_0"',
-        '(symbol "ESP32_WROVER_B_E_PSRAM_0_0"',
-      ),
-    ]
+    for match in re.finditer(r'\(symbol\s+"([^"]+)"', cache_block):
+      raw_name = match.group(1)
+      _, item_name = splitFootprintReference(raw_name)
+      if hasUnsafeLocalItemNameChars(item_name):
+        skipped_unsafe_cache_refs += 1
+        if logger is not None:
+          logger.error(
+            f"skipping cached symbol '{raw_name}' because the name contains invalid characters ('/' or parentheses)"
+          )
 
-    for old_text, new_text in sanitize_replacements:
-      if old_text in cache_block:
-        rewritten_cache_sanitized += cache_block.count(old_text)
-        cache_block = cache_block.replace(old_text, new_text)
+    for match in re.finditer(r'\(property\s+"Footprint"\s+"([^"]*)"', cache_block):
+      footprint_ref = match.group(1)
+      _, base_name = splitFootprintReference(footprint_ref)
+      base_name = base_name or footprint_ref
+      if hasUnsafeLocalItemNameChars(base_name):
+        skipped_unsafe_cache_refs += 1
+        if logger is not None:
+          logger.error(
+            f"skipping cached footprint '{footprint_ref}' because the name contains invalid characters ('/' or parentheses)"
+          )
 
     lib_symbols_block = cache_block
 
@@ -1153,7 +1190,7 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map):
     "footprints": rewritten_footprints,
     "lib_symbols": rewritten_lib_symbols,
     "cache_footprints": rewritten_cache_footprints,
-    "cache_sanitized": rewritten_cache_sanitized,
+    "cache_skipped_unsafe": skipped_unsafe_cache_refs,
   }
 
 
@@ -1573,13 +1610,6 @@ def logModelRefSummary(logger, root, pcb_path, phase):
 
 
 def ensureTables(root):
-  removeLibTableEntriesByName(
-    root / "sym-lib-table",
-    {
-      "esp32-wrover-b:e_(psram)",
-    },
-  )
-
   upsertProjectLibTable(
     root / "fp-lib-table",
     "fp",
@@ -1706,21 +1736,21 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
     logger.info(f"all board footprints exported to localLib.pretty: {extra_fp_count}")
 
     logger.info(f"5) Build {LOCAL_LIBS_DIR}/3d from components/")
-    buildCombined3dDirectory(root, exported, board)
+    _, _, skipped_unsafe_board_models = buildCombined3dDirectory(root, exported, board, logger)
 
     logger.info("6) Write project library tables")
     ensureTables(root)
 
     if REWRITE_SCHEMATIC_REFS:
       logger.info("7) Rewrite schematic library references")
-      rewrite_stats = rewriteSchematic(sch_path, component_name_map, footprint_name_map)
+      rewrite_stats = rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger)
       logger.info(
         "schematic rewritten: "
         f"lib_ids={rewrite_stats['lib_ids']}, "
         f"footprints={rewrite_stats['footprints']}, "
         f"lib_symbols={rewrite_stats['lib_symbols']}, "
         f"cache_footprints={rewrite_stats['cache_footprints']}, "
-        f"cache_sanitized={rewrite_stats['cache_sanitized']}"
+        f"cache_skipped_unsafe={rewrite_stats['cache_skipped_unsafe']}"
       )
       if SYNC_SCHEMATIC_LIB_SYMBOLS:
         cache_count = syncSchematicLibSymbolsFromLocalLibrary(
@@ -1758,8 +1788,27 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
       f"pcb3d={changed_models}"
     )
 
+    skipped_symbols = export_stats.get("skipped_unsafe_component_name", 0)
+    skipped_footprints = export_stats.get("skipped_unsafe_footprint_name", 0)
+    skipped_models = (
+      export_stats.get("skipped_unsafe_model_name", 0)
+      + skipped_unsafe_board_models
+    )
+    skipped_total = skipped_symbols + skipped_footprints + skipped_models
+
+    if skipped_total > 0:
+      logger.error(
+        "PROJECT IS NOT PORTABLE: "
+        f"[{skipped_symbols}] Symbols, "
+        f"[{skipped_footprints}] Footprints, "
+        f"[{skipped_models}] 3D models "
+        "were skipped because their names contain invalid characters ('/' or parentheses)"
+      )
+      logger.info(f"DONE (components + {LOCAL_LIBS_DIR}/) WITH ERRORS")
+    else:
+      logger.info(f"DONE (components + {LOCAL_LIBS_DIR}/)")
+
     pcbnew.Refresh()
-    logger.info(f"DONE (components + {LOCAL_LIBS_DIR}/)")
 
 
 KiCadLocalizerPlugin().register()
