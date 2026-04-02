@@ -17,13 +17,13 @@ LOCAL_LIB = "localLib"
 LOCAL_LIBS_DIR = "localLibs"
 MODEL_EXT_PRIORITY = [".step", ".stp", ".wrl"]
 REWRITE_SCHEMATIC_REFS = True
-SYNC_SCHEMATIC_LIB_SYMBOLS = False
+SYNC_SCHEMATIC_LIB_SYMBOLS = True
 
 _PATH_VARS_CACHE = {}
 
 
 def toSafeLocalItemName(raw_name):
-  safe = re.sub(r'[\\/:*?"<>|()\[\]{}\-]+', "_", str(raw_name).strip())
+  safe = re.sub(r'[\\/:*?"<>|()\[\]{}]+', "_", str(raw_name).strip())
   safe = re.sub(r'\s+', "_", safe)
   safe = re.sub(r'_+', "_", safe).strip("._")
   return safe if safe else "component"
@@ -148,6 +148,25 @@ def loadProjectTextVars(project_root):
     return {}
 
   return {k: v for k, v in text_vars.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def collectProjectSchematicPaths(root, project_name):
+  all_sch = sorted(root.glob("*.kicad_sch"))
+  main_sch = root / f"{project_name}.kicad_sch"
+
+  if not all_sch:
+    return []
+
+  ordered = []
+  if main_sch in all_sch:
+    ordered.append(main_sch)
+
+  for sch in all_sch:
+    if sch == main_sch:
+      continue
+    ordered.append(sch)
+
+  return ordered
 
 
 def getPathVars(project_root=None):
@@ -1068,7 +1087,9 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=No
   content = sch_path.read_text(encoding="utf-8")
   rewritten_lib_ids = 0
   rewritten_footprints = 0
+  rewritten_symbol_instances_footprints = 0
   rewritten_lib_symbols = 0
+  rewritten_cache_symbol_names = 0
   rewritten_cache_footprints = 0
   skipped_unsafe_cache_refs = 0
 
@@ -1114,47 +1135,30 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=No
     working_content,
   )
 
+  # Also rewrite symbol_instances/path footprint refs so Assign Footprints shows localLib.
+  def rewriteSymbolInstancesFootprint(match):
+    nonlocal rewritten_symbol_instances_footprints
+    footprint_ref = match.group(1)
+    _, base_name = splitFootprintReference(footprint_ref)
+    base_name = base_name or footprint_ref
+    local_name = footprint_name_map.get(base_name)
+    if local_name is None:
+      return match.group(0)
+
+    rewritten_symbol_instances_footprints += 1
+    return f'(footprint "{LOCAL_LIB}:{local_name}")'
+
+  working_content = re.sub(
+    r'\(footprint\s+"([^"]*)"\)',
+    rewriteSymbolInstancesFootprint,
+    working_content,
+  )
+
   if lib_symbols_block is not None:
     cache_block = lib_symbols_block
 
-    # Keep lib_symbols cache aligned with localized instance refs.
-    def rewriteCacheSymbolName(match):
-      nonlocal rewritten_lib_symbols
-      lib_name = match.group(1)
-      item_name = match.group(2)
-      if lib_name == "power":
-        return match.group(0)
-
-      local_name = component_name_map.get(item_name)
-      if local_name is None:
-        return match.group(0)
-
-      rewritten_lib_symbols += 1
-      return f'(symbol "{LOCAL_LIB}:{local_name}"'
-
-    cache_block = re.sub(
-      r'\(symbol\s+"([^":]+):([^"]+)"',
-      rewriteCacheSymbolName,
-      cache_block,
-    )
-
-    # Localize cached Footprint properties in lib_symbols as well.
-    def rewriteCacheFootprintProperty(match):
-      nonlocal rewritten_cache_footprints
-      footprint_ref = match.group(2)
-      _, base_name = splitFootprintReference(footprint_ref)
-      base_name = base_name or footprint_ref
-      local_name = footprint_name_map.get(base_name)
-      if local_name is None:
-        return match.group(0)
-      rewritten_cache_footprints += 1
-      return f'{match.group(1)}{LOCAL_LIB}:{local_name}{match.group(3)}'
-
-    cache_block = re.sub(
-      r'(\(property\s+"Footprint"\s+")([^"]*)(")',
-      rewriteCacheFootprintProperty,
-      cache_block,
-    )
+    # Safe mode: do not mutate lib_symbols cache names/properties because this can
+    # break symbol-unit prefix consistency on hierarchical sheets.
 
     for match in re.finditer(r'\(symbol\s+"([^"]+)"', cache_block):
       raw_name = match.group(1)
@@ -1188,7 +1192,9 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=No
   return {
     "lib_ids": rewritten_lib_ids,
     "footprints": rewritten_footprints,
+    "symbol_instances_footprints": rewritten_symbol_instances_footprints,
     "lib_symbols": rewritten_lib_symbols,
+    "cache_symbol_names": rewritten_cache_symbol_names,
     "cache_footprints": rewritten_cache_footprints,
     "cache_skipped_unsafe": skipped_unsafe_cache_refs,
   }
@@ -1653,17 +1659,48 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
 
     sch_path = root / f"{project_name}.kicad_sch"
     pcb_path = root / f"{project_name}.kicad_pcb"
+    sch_paths = collectProjectSchematicPaths(root, project_name)
 
-    if not sch_path.exists() or not pcb_path.exists():
+    if not sch_paths or not pcb_path.exists():
       logger.error("schematic or board file not found")
       return
 
     logger.info("LOCALIZING...")
     logger.info(f"project root: {root}")
+    logger.info(f"schematic files found: {len(sch_paths)}")
+    for sch_file in sch_paths:
+      logger.info(f"  schematic: {sch_file.name}")
     logger.info("1) Parse schematic and board")
 
-    sch_content, components, footprint_to_component, reference_to_component = parseUsedComponents(sch_path)
-    symbol_map = extractSymbolDefinitionMap(sch_content)
+    components = {}
+    footprint_to_component = {}
+    reference_to_component = {}
+    symbol_map = {}
+
+    for current_sch_path in sch_paths:
+      sch_content, sch_components, sch_footprint_to_component, sch_reference_to_component = parseUsedComponents(current_sch_path)
+      sch_symbol_map = extractSymbolDefinitionMap(sch_content)
+
+      for component_name, component_info in sch_components.items():
+        if component_name not in components:
+          components[component_name] = dict(component_info)
+          continue
+
+        if not components[component_name].get("footprint") and component_info.get("footprint"):
+          components[component_name]["footprint"] = component_info["footprint"]
+
+        if not components[component_name].get("footprint_full") and component_info.get("footprint_full"):
+          components[component_name]["footprint_full"] = component_info["footprint_full"]
+
+      for footprint_name, component_name in sch_footprint_to_component.items():
+        footprint_to_component.setdefault(footprint_name, component_name)
+
+      for reference_name, component_name in sch_reference_to_component.items():
+        reference_to_component[reference_name] = component_name
+
+      for symbol_name, symbol_block in sch_symbol_map.items():
+        symbol_map.setdefault(symbol_name, symbol_block)
+
     footprint_map = extractFootprintMap(pcb_path)
     footprint_name_map = buildUniqueNameMap(footprint_map.keys())
     model_paths = collectFootprintModelPaths(board)
@@ -1743,23 +1780,41 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
 
     if REWRITE_SCHEMATIC_REFS:
       logger.info("7) Rewrite schematic library references")
-      rewrite_stats = rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger)
+      rewrite_stats = {
+        "lib_ids": 0,
+        "footprints": 0,
+        "symbol_instances_footprints": 0,
+        "lib_symbols": 0,
+        "cache_symbol_names": 0,
+        "cache_footprints": 0,
+        "cache_skipped_unsafe": 0,
+      }
+
+      for current_sch_path in sch_paths:
+        current_stats = rewriteSchematic(current_sch_path, component_name_map, footprint_name_map, logger)
+        for key in rewrite_stats.keys():
+          rewrite_stats[key] += current_stats.get(key, 0)
+
       logger.info(
         "schematic rewritten: "
         f"lib_ids={rewrite_stats['lib_ids']}, "
         f"footprints={rewrite_stats['footprints']}, "
+        f"symbol_instances_footprints={rewrite_stats['symbol_instances_footprints']}, "
         f"lib_symbols={rewrite_stats['lib_symbols']}, "
+        f"cache_symbol_names={rewrite_stats['cache_symbol_names']}, "
         f"cache_footprints={rewrite_stats['cache_footprints']}, "
         f"cache_skipped_unsafe={rewrite_stats['cache_skipped_unsafe']}"
       )
       if SYNC_SCHEMATIC_LIB_SYMBOLS:
-        cache_count = syncSchematicLibSymbolsFromLocalLibrary(
-          root,
-          sch_path,
-          set(exported.keys()),
-          logger,
-        )
-        logger.info(f"schematic lib_symbols cache synced from localLib: {cache_count}")
+        cache_count = 0
+        for current_sch_path in sch_paths:
+          cache_count += syncSchematicLibSymbolsFromLocalLibrary(
+            root,
+            current_sch_path,
+            set(exported.keys()),
+            logger,
+          )
+        logger.info(f"schematic lib_symbols cache synced from localLib (all sheets): {cache_count}")
       else:
         logger.info("schematic lib_symbols cache sync skipped (safe mode)")
     else:
