@@ -862,7 +862,6 @@ def exportComponentFiles(
       continue
 
     local_name = makeUniqueLocalItemName(component_name, used_local_names)
-    component_name_map[component_name] = local_name
     if local_name != component_name:
       logger.warn(f"component '{component_name}' will be localized as '{local_name}'")
 
@@ -881,12 +880,9 @@ def exportComponentFiles(
       stats["missing_symbol_definition"] += 1
       continue
 
-    component_dir = components_dir / local_name
-    component_dir.mkdir(parents=True, exist_ok=True)
-
     has_footprint = False
     local_footprint_name = local_name
-    footprint_path = component_dir / f"{local_footprint_name}.kicad_mod"
+    footprint_path = None
 
     if not footprint_name:
       logger.info(
@@ -904,10 +900,22 @@ def exportComponentFiles(
     else:
       footprint_block = footprint_map.get(footprint_name)
       if footprint_block is None:
+        fallback_name = component_to_footprint_fallback.get(component_name, "")
+        if fallback_name and fallback_name != footprint_name:
+          footprint_block = footprint_map.get(fallback_name)
+          if footprint_block is not None:
+            logger.warn(
+              f"component '{component_name}' schematic footprint '{footprint_name}' not found on board; "
+              f"using board footprint '{fallback_name}' from reference mapping"
+            )
+            footprint_name = fallback_name
+
+      if footprint_block is None:
         # If the board was already localized, footprint names may already match component names.
         footprint_block = footprint_map.get(component_name)
         if footprint_block is not None:
           footprint_name = component_name
+
       if footprint_block is None:
         logger.warn(
           f"skipping component '{component_name}' because footprint definition "
@@ -916,6 +924,8 @@ def exportComponentFiles(
         stats["missing_footprint_definition"] += 1
         continue
       else:
+        component_dir = components_dir / local_name
+        component_dir.mkdir(parents=True, exist_ok=True)
         local_footprint_name = footprint_name_map.get(footprint_name, local_name)
         footprint_path = component_dir / f"{local_footprint_name}.kicad_mod"
         mod_text = normalizeFootprintBlockName(footprint_block, local_footprint_name) + "\n"
@@ -933,6 +943,7 @@ def exportComponentFiles(
     )
     (component_dir / f"{local_name}.kicad_sym").write_text(symbol_text, encoding="utf-8")
     stats["exported_symbol"] += 1
+    component_name_map[component_name] = local_name
 
     # Prefer footprint-bound model mapping. A symbol can be reused with multiple
     # footprints, so component-name model mapping is only a fallback.
