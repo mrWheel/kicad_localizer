@@ -1424,35 +1424,49 @@ def upsertProjectLibTable(table_path, table_type, name, uri):
     root_token = "fp_lib_table"
 
   lib_entry = (
-    f'  (lib (name "{name}")\n'
-    f'    (type "KiCad")\n'
-    f'    (uri "{uri}")\n'
-    "  )\n"
+    f'  (lib (name "{name}")(type "KiCad")(uri "{uri}")(options "")(descr ""))\n'
   )
 
   if table_path.exists():
     content = table_path.read_text(encoding="utf-8")
   else:
-    content = f"({root_token}\n)\n"
+    content = f"({root_token}\n  (version 7)\n)\n"
 
-  if re.search(r'\(lib\s+\(name\s+"' + re.escape(name) + r'"\)', content):
-    # Replace existing entry for this library name.
-    pattern = (
-      r'\(lib\s+\(name\s+"' + re.escape(name) + r'"\)'  # start of target lib
-      r'(?:\s|\n)*\(type\s+"[^"]+"\)'
-      r'(?:\s|\n)*\(uri\s+"[^"]+"\)'
-      r'(?:\s|\n)*\)'
-    )
-    content = re.sub(pattern, lib_entry.rstrip(), content, count=1)
+  # Ensure table has a version line; KiCad can ignore malformed/minimal tables.
+  if re.search(r'\(version\s+\d+\)', content) is None:
+    open_idx = content.find("\n")
+    if open_idx != -1:
+      content = content[:open_idx + 1] + "  (version 7)\n" + content[open_idx + 1:]
+
+  # Remove any existing entry for this library name (supports multiline variations).
+  updated = content
+  scan_index = 0
+  while True:
+    start = updated.find("(lib ", scan_index)
+    if start == -1:
+      break
+
+    block = findBalancedBlock(updated, start)
+    if block is None:
+      break
+
+    if re.search(r'\(name\s+"' + re.escape(name) + r'"\)', block):
+      updated = updated[:start] + updated[start + len(block):]
+      scan_index = 0
+      continue
+
+    scan_index = start + len(block)
+
+  # Insert before final ')' of table root.
+  idx = updated.rfind(")")
+  if idx == -1:
+    updated = f"({root_token}\n  (version 7)\n{lib_entry})\n"
   else:
-    # Insert before final ')' of table root.
-    idx = content.rfind(")")
-    if idx == -1:
-      content = f"({root_token}\n{lib_entry})\n"
-    else:
-      content = content[:idx] + lib_entry + content[idx:]
+    updated = updated[:idx] + lib_entry + updated[idx:]
 
-  table_path.write_text(content, encoding="utf-8")
+  updated = re.sub(r'\n{3,}', '\n\n', updated)
+
+  table_path.write_text(updated, encoding="utf-8")
 
 
 def rewriteBoard(board, root, footprint_name_map, reference_to_component, component_name_map, logger=None):
