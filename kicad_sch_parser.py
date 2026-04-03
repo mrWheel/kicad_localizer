@@ -4,6 +4,7 @@ import os
 import sys
 import argparse
 import logging
+from pathlib import Path
 
 
 # --- Configure logging
@@ -273,6 +274,47 @@ def getLibId(symbol):
   return None
 
 
+def getChildAtom(node, head):
+
+  if not isinstance(node, list):
+    return None
+
+  for child in node:
+    if isinstance(child, list) and child and child[0] == head and len(child) > 1 and isinstance(child[1], str):
+      return child[1]
+
+  return None
+
+
+def extractSymbolInstanceAssignments(tree):
+
+  assignments = []
+
+  def walk(node, inSymbolInstances=False):
+
+    if not isinstance(node, list) or not node:
+      return
+
+    nowInSymbolInstances = inSymbolInstances or node[0] == "symbol_instances"
+
+    if nowInSymbolInstances and node[0] == "path":
+      ref = getChildAtom(node, "reference")
+      footprint = getChildAtom(node, "footprint")
+      pathValue = node[1] if len(node) > 1 and isinstance(node[1], str) else ""
+
+      assignments.append({
+        "reference": ref,
+        "footprint": footprint,
+        "path": pathValue,
+      })
+
+    for child in node:
+      walk(child, nowInSymbolInstances)
+
+  walk(tree)
+  return assignments
+
+
 def normalizeLibraryQualifiedName(rawValue):
 
   if not rawValue:
@@ -379,9 +421,9 @@ def runSyntaxCheck(sheetEntries):
   return 0
 
 
-# --- Mode 2: compare file1 with file2 (without library refs)
+# --- Mode 2: compare file1 with file2
 
-def runDiff(sheetEntries1, sheetEntries2):
+def runDiff(sheetEntries1, sheetEntries2, strictDiff=False, file2MainPath=None):
 
   def buildSymbolMap(sheetEntries):
 
@@ -402,11 +444,17 @@ def runDiff(sheetEntries1, sheetEntries2):
         if key in mapping:
           logging.debug(f"Duplicate placed symbol key in diff: {key}")
 
+        libId = getLibId(symbol)
         mapping[key] = {
           "sheet": sheetPath,
           "ref": ref,
           "value": getProperty(symbol, "Value"),
-          "footprint": normalizeLibraryQualifiedName(getProperty(symbol, "Footprint")),
+          "footprint": (
+            getProperty(symbol, "Footprint")
+            if strictDiff
+            else normalizeLibraryQualifiedName(getProperty(symbol, "Footprint"))
+          ),
+          "lib": libId if strictDiff else None,
         }
 
     return mapping
@@ -415,6 +463,39 @@ def runDiff(sheetEntries1, sheetEntries2):
   map1 = buildSymbolMap(sheetEntries1)
   map2 = buildSymbolMap(sheetEntries2)
   allKeys = set(map1.keys()) | set(map2.keys())
+
+  # In normal diff mode, explicitly report non-localized symbols in file2.
+  if not strictDiff:
+    nonLocalCount = 0
+
+    for entry in sheetEntries2:
+      sheetPath = entry["sheetPath"]
+
+      for symbol in extractPlacedSymbols(entry["tree"]):
+        ref = getProperty(symbol, "Reference") or "?"
+        value = getProperty(symbol, "Value") or "?"
+        libId = getLibId(symbol) or ""
+
+        if not libId:
+          continue
+
+        # power:* symbols are intentionally not localized by the plugin.
+        if libId.startswith("power:"):
+          continue
+
+        if not libId.startswith("localLib:"):
+          logging.error(
+            f"Not localized in file2: [{sheetPath}] {ref} "
+            f"{{'value': {repr(value)}, 'lib': {repr(libId)}}}"
+          )
+          nonLocalCount += 1
+
+    if nonLocalCount == 0:
+      logging.info("All non-power symbols in file2 reference localLib")
+
+    footprintIssues = validateFootprintAssignments(sheetEntries2, file2MainPath)
+    if footprintIssues == 0:
+      logging.info("Footprint assignments in file2 are consistent with localLib")
 
   changesFound = 0
 
@@ -442,17 +523,102 @@ def runDiff(sheetEntries1, sheetEntries2):
     new = map2[key]
 
     if old["value"] != new["value"] or old["footprint"] != new["footprint"]:
-      logging.info(
-        f"Changed: [{old['sheet']}] {old['ref']} "
-        f"{{'value': {repr(old['value'])}, 'footprint': {repr(old['footprint'])}}} -> "
-        f"{{'value': {repr(new['value'])}, 'footprint': {repr(new['footprint'])}}}"
-      )
+      if strictDiff:
+        logging.info(
+          f"Changed: [{old['sheet']}] {old['ref']} "
+          f"{{'value': {repr(old['value'])}, 'lib': {repr(old['lib'])}, 'footprint': {repr(old['footprint'])}}} -> "
+          f"{{'value': {repr(new['value'])}, 'lib': {repr(new['lib'])}, 'footprint': {repr(new['footprint'])}}}"
+        )
+      else:
+        logging.info(
+          f"Changed: [{old['sheet']}] {old['ref']} "
+          f"{{'value': {repr(old['value'])}, 'footprint': {repr(old['footprint'])}}} -> "
+          f"{{'value': {repr(new['value'])}, 'footprint': {repr(new['footprint'])}}}"
+        )
       changesFound += 1
 
   if changesFound == 0:
     logging.info("No differences found")
 
   return 0
+
+
+def validateFootprintAssignments(sheetEntries, fileMainPath):
+
+  issues = 0
+
+  localFootprints = None
+  if fileMainPath:
+    root = Path(fileMainPath).resolve().parent
+    localPrettyDir = root / "localLibs" / "localLib.pretty"
+    if localPrettyDir.exists():
+      localFootprints = {p.stem for p in localPrettyDir.glob("*.kicad_mod") if p.is_file()}
+    else:
+      logging.warning(f"local footprint library not found: {localPrettyDir}")
+
+  for entry in sheetEntries:
+    sheetPath = entry["sheetPath"]
+    tree = entry["tree"]
+
+    symbolByRef = {}
+
+    for symbol in extractPlacedSymbols(tree):
+      ref = getProperty(symbol, "Reference")
+      if not ref:
+        continue
+
+      libId = getLibId(symbol) or ""
+      footprint = getProperty(symbol, "Footprint") or ""
+      symbolByRef[ref] = footprint
+
+      if libId.startswith("power:"):
+        continue
+
+      if footprint and not footprint.startswith("localLib:"):
+        logging.error(
+          f"Footprint assignment not localized: [{sheetPath}] {ref} "
+          f"uses {repr(footprint)}"
+        )
+        issues += 1
+
+      if footprint.startswith("localLib:") and localFootprints is not None:
+        fpName = footprint.split(":", 1)[1]
+        if fpName not in localFootprints:
+          logging.error(
+            f"Footprint missing in localLib.pretty: [{sheetPath}] {ref} "
+            f"uses {repr(footprint)}"
+          )
+          issues += 1
+
+    for item in extractSymbolInstanceAssignments(tree):
+      ref = item.get("reference") or "?"
+      footprint = item.get("footprint") or ""
+
+      if footprint and not footprint.startswith("localLib:"):
+        logging.error(
+          f"symbol_instances footprint not localized: [{sheetPath}] {ref} "
+          f"uses {repr(footprint)}"
+        )
+        issues += 1
+
+      if footprint.startswith("localLib:") and localFootprints is not None:
+        fpName = footprint.split(":", 1)[1]
+        if fpName not in localFootprints:
+          logging.error(
+            f"symbol_instances footprint missing in localLib.pretty: [{sheetPath}] {ref} "
+            f"uses {repr(footprint)}"
+          )
+          issues += 1
+
+      symbolFootprint = symbolByRef.get(ref)
+      if symbolFootprint and footprint and symbolFootprint != footprint:
+        logging.error(
+          f"Footprint mismatch symbol vs symbol_instances: [{sheetPath}] {ref} "
+          f"symbol={repr(symbolFootprint)} vs symbol_instances={repr(footprint)}"
+        )
+        issues += 1
+
+  return issues
 
 
 # --- Mode 3: netlist checks
@@ -521,6 +687,7 @@ def main():
 
   parser.add_argument("--debug", action="store_true", help="Enable debug logging")
   parser.add_argument("--netlist", action="store_true", help="Run netlist checks on file1 (and sub-sheets)")
+  parser.add_argument("--strict-diff", action="store_true", help="Diff mode: compare raw values including library prefixes")
   parser.add_argument("file1", help="Main .kicad_sch file")
   parser.add_argument("file2", nargs="?", help="Second main .kicad_sch file (diff mode)")
 
@@ -528,6 +695,12 @@ def main():
 
   if args.netlist and args.file2:
     parser.error("--netlist mode accepts only file1")
+
+  if args.strict_diff and not args.file2:
+    parser.error("--strict-diff requires file2 (diff mode)")
+
+  if args.strict_diff and args.netlist:
+    parser.error("--strict-diff cannot be combined with --netlist")
 
   setupLogging(args.debug)
 
@@ -542,7 +715,12 @@ def main():
     sheets2 = loadAllSheets(args.file2, debug=args.debug)
     if not sheets1 or not sheets2:
       return 1
-    return runDiff(sheets1, sheets2)
+    return runDiff(
+      sheets1,
+      sheets2,
+      strictDiff=args.strict_diff,
+      file2MainPath=args.file2,
+    )
 
   # Mode 1: extensive syntax check
   sheets = loadAllSheets(args.file1, debug=args.debug)

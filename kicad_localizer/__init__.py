@@ -1125,11 +1125,20 @@ def buildCombined3dDirectory(root, exported_components, board=None, logger=None)
   return out_dir, model_ext_by_component, skipped_unsafe_models
 
 
-def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=None):
+def rewriteSchematic(
+  sch_path,
+  component_name_map,
+  footprint_name_map,
+  reference_to_component,
+  component_to_local_footprint,
+  logger=None,
+):
   content = sch_path.read_text(encoding="utf-8")
   rewritten_lib_ids = 0
   rewritten_footprints = 0
+  rewritten_footprints_by_reference = 0
   rewritten_symbol_instances_footprints = 0
+  rewritten_symbol_instances_footprints_by_reference = 0
   rewritten_lib_symbols = 0
   rewritten_cache_symbol_names = 0
   rewritten_cache_footprints = 0
@@ -1177,6 +1186,33 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=No
     working_content,
   )
 
+  # Reference-based fallback: if schematic footprint text is stale or mismatched,
+  # force footprint assignment from exported component mapping.
+  symbol_blocks = extractSymbolBlocks(working_content)
+  for block in symbol_blocks:
+    if "(lib_id \"" not in block:
+      continue
+
+    reference_match = re.search(r'\(property\s+"Reference"\s+"([^"]+)"', block)
+    if not reference_match:
+      continue
+
+    reference = reference_match.group(1).strip()
+    component_name = reference_to_component.get(reference)
+    if not component_name:
+      continue
+
+    local_footprint_name = component_to_local_footprint.get(component_name)
+    if not local_footprint_name:
+      continue
+
+    desired_ref = f"{LOCAL_LIB}:{local_footprint_name}"
+    updated_block = rewriteSymbolFootprintProperty(block, desired_ref)
+
+    if updated_block != block:
+      rewritten_footprints_by_reference += 1
+      working_content = working_content.replace(block, updated_block, 1)
+
   # Also rewrite symbol_instances/path footprint refs so Assign Footprints shows localLib.
   def rewriteSymbolInstancesFootprint(match):
     nonlocal rewritten_symbol_instances_footprints
@@ -1195,6 +1231,48 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=No
     rewriteSymbolInstancesFootprint,
     working_content,
   )
+
+  # Reference-based fallback for symbol_instances/path footprint entries.
+  symbol_instances_block = findBlockByToken(working_content, "(symbol_instances")
+  if symbol_instances_block is not None:
+    updated_symbol_instances = symbol_instances_block
+    path_blocks = extractBlocksByToken(symbol_instances_block, "(path ")
+
+    for path_block in path_blocks:
+      reference_match = re.search(r'\(reference\s+"([^"]+)"\)', path_block)
+      if not reference_match:
+        continue
+
+      reference = reference_match.group(1).strip()
+      component_name = reference_to_component.get(reference)
+      if not component_name:
+        continue
+
+      local_footprint_name = component_to_local_footprint.get(component_name)
+      if not local_footprint_name:
+        continue
+
+      desired_ref = f"{LOCAL_LIB}:{local_footprint_name}"
+      current_footprint_match = re.search(r'\(footprint\s+"([^"]*)"\)', path_block)
+      if not current_footprint_match:
+        continue
+
+      current_ref = current_footprint_match.group(1)
+      if current_ref == desired_ref:
+        continue
+
+      updated_path_block = re.sub(
+        r'\(footprint\s+"([^"]*)"\)',
+        f'(footprint "{desired_ref}")',
+        path_block,
+        count=1,
+      )
+      if updated_path_block != path_block:
+        rewritten_symbol_instances_footprints_by_reference += 1
+        updated_symbol_instances = updated_symbol_instances.replace(path_block, updated_path_block, 1)
+
+    if updated_symbol_instances != symbol_instances_block:
+      working_content = working_content.replace(symbol_instances_block, updated_symbol_instances, 1)
 
   if lib_symbols_block is not None:
     cache_block = lib_symbols_block
@@ -1234,7 +1312,9 @@ def rewriteSchematic(sch_path, component_name_map, footprint_name_map, logger=No
   return {
     "lib_ids": rewritten_lib_ids,
     "footprints": rewritten_footprints,
+    "footprints_by_reference": rewritten_footprints_by_reference,
     "symbol_instances_footprints": rewritten_symbol_instances_footprints,
+    "symbol_instances_footprints_by_reference": rewritten_symbol_instances_footprints_by_reference,
     "lib_symbols": rewritten_lib_symbols,
     "cache_symbol_names": rewritten_cache_symbol_names,
     "cache_footprints": rewritten_cache_footprints,
@@ -1837,10 +1917,17 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
 
     if REWRITE_SCHEMATIC_REFS:
       logger.info("7) Rewrite schematic library references")
+      component_to_local_footprint = {
+        component_name: info.get("local_footprint_name")
+        for component_name, info in exported.items()
+        if info.get("has_footprint") and info.get("local_footprint_name")
+      }
       rewrite_stats = {
         "lib_ids": 0,
         "footprints": 0,
+        "footprints_by_reference": 0,
         "symbol_instances_footprints": 0,
+        "symbol_instances_footprints_by_reference": 0,
         "lib_symbols": 0,
         "cache_symbol_names": 0,
         "cache_footprints": 0,
@@ -1848,7 +1935,14 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
       }
 
       for current_sch_path in sch_paths:
-        current_stats = rewriteSchematic(current_sch_path, component_name_map, footprint_name_map, logger)
+        current_stats = rewriteSchematic(
+          current_sch_path,
+          component_name_map,
+          footprint_name_map,
+          reference_to_component,
+          component_to_local_footprint,
+          logger,
+        )
         for key in rewrite_stats.keys():
           rewrite_stats[key] += current_stats.get(key, 0)
 
@@ -1856,7 +1950,9 @@ class KiCadLocalizerPlugin(pcbnew.ActionPlugin):
         "schematic rewritten: "
         f"lib_ids={rewrite_stats['lib_ids']}, "
         f"footprints={rewrite_stats['footprints']}, "
+        f"footprints_by_reference={rewrite_stats['footprints_by_reference']}, "
         f"symbol_instances_footprints={rewrite_stats['symbol_instances_footprints']}, "
+        f"symbol_instances_footprints_by_reference={rewrite_stats['symbol_instances_footprints_by_reference']}, "
         f"lib_symbols={rewrite_stats['lib_symbols']}, "
         f"cache_symbol_names={rewrite_stats['cache_symbol_names']}, "
         f"cache_footprints={rewrite_stats['cache_footprints']}, "
